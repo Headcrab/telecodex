@@ -2,6 +2,10 @@
 *.sqlite3
 *.sqlite3-*
 /tmp
+/logs
+/run
+/.msvc-kit
+/.tools
 telecodex.toml
 tmp-config.toml
 .env

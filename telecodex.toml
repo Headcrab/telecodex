@@ -1,0 +1,33 @@
+db_path = "D:/GitStorageG/RemoteCodex/telecodex.sqlite3"
+startup_admin_ids = [492309203]
+poll_timeout_seconds = 30
+edit_debounce_ms = 900
+max_text_chunk = 3500
+tmp_dir = "D:/GitStorageG/RemoteCodex/tmp"
+
+[telegram]
+primary_forum_chat_id = -1003807165789
+auto_create_topics = false
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+api_base = "https://api.telegram.org"
+use_message_drafts = true
+
+[codex]
+binary = "C:/Users/admin/.vscode/extensions/openai.chatgpt-26.325.31654-win32-x64/bin/windows-x86_64/codex.exe"
+default_cwd = "D:/GitStorageG"
+default_model = "gpt-5.4"
+default_reasoning_effort = "medium"
+default_sandbox = "read-only"
+default_approval = "on-request"
+default_search_mode = "disabled"
+import_desktop_history = true
+import_cli_history = true
+seed_workspaces = [
+  "D:/GitStorageG/daam",
+  "D:/GitStorageG/DMNeuralShading",
+  "D:/GitStorageG/kombez",
+  "D:/GitStorageG/speed-dreams-code",
+]
+default_add_dirs = [
+  "D:/GitStorageG",
+]
