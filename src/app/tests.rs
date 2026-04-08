@@ -168,6 +168,61 @@ fn builds_clickable_chat_sessions_keyboard() {
 }
 
 #[test]
+fn builds_topic_links_for_dashboard_root_sessions_keyboard() {
+    let root_session = crate::models::SessionRecord {
+        id: 1,
+        key: SessionKey::new(-1001234567890, None),
+        session_title: Some("Dashboard".to_string()),
+        codex_thread_id: None,
+        force_fresh_thread: false,
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+        cwd: sample_workspace(),
+        model: None,
+        reasoning_effort: None,
+        session_prompt: None,
+        sandbox_mode: "workspace-write".to_string(),
+        approval_policy: "never".to_string(),
+        search_mode: SearchMode::Disabled,
+        add_dirs: vec![],
+        busy: false,
+    };
+    let topic_session = crate::models::SessionRecord {
+        id: 2,
+        key: SessionKey::new(-1001234567890, Some(323)),
+        session_title: Some("Water meter".to_string()),
+        codex_thread_id: Some("019ce152-99e8-7c30-b5b7-166e6aebd550".to_string()),
+        force_fresh_thread: false,
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+        cwd: sample_workspace(),
+        model: None,
+        reasoning_effort: None,
+        session_prompt: None,
+        sandbox_mode: "workspace-write".to_string(),
+        approval_policy: "never".to_string(),
+        search_mode: SearchMode::Disabled,
+        add_dirs: vec![],
+        busy: false,
+    };
+    let chat = crate::telegram::Chat {
+        id: -1001234567890,
+        kind: "supergroup".to_string(),
+        is_forum: Some(true),
+        username: Some("varv_alarms_bot_chat".to_string()),
+        title: Some("Codex chat".to_string()),
+    };
+
+    let keyboard =
+        chat_sessions_keyboard(&root_session, &chat, std::slice::from_ref(&topic_session))
+            .unwrap();
+
+    assert_eq!(keyboard.inline_keyboard[0][0].callback_data, None);
+    assert_eq!(
+        keyboard.inline_keyboard[0][0].url,
+        Some("https://t.me/varv_alarms_bot_chat/323?thread=323".to_string())
+    );
+}
+
+#[test]
 fn derives_private_topic_link_slug_from_bot_api_chat_id() {
     assert_eq!(private_topic_link_slug(-1001234567890), Some(1234567890));
     assert_eq!(private_topic_link_slug(275328656), None);
@@ -663,14 +718,20 @@ fn detects_commands_that_use_session_context() {
         BridgeCommand::Copy
     )));
     assert!(!command_uses_session_context(&ParsedInput::Bridge(
+        BridgeCommand::Sessions
+    )));
+    assert!(!command_uses_session_context(&ParsedInput::Bridge(
+        BridgeCommand::Status
+    )));
+    assert!(!command_uses_session_context(&ParsedInput::Bridge(
         BridgeCommand::RestartBot
     )));
 }
 
 #[test]
 fn detects_commands_that_require_codex_auth() {
-    assert!(parsed_input_requires_codex_auth(&ParsedInput::Forward(
-        "/status".to_string()
+    assert!(!parsed_input_requires_codex_auth(&ParsedInput::Bridge(
+        BridgeCommand::Status
     )));
     assert!(parsed_input_requires_codex_auth(&ParsedInput::Bridge(
         BridgeCommand::Review(crate::models::ReviewRequest {

@@ -695,6 +695,28 @@ impl App {
                             message.message_thread_id,
                             &body,
                             codex_sessions_keyboard(&session, &sessions),
+                            )
+                            .await?;
+                    }
+                }
+                BridgeCommand::Status => {
+                    if is_primary_forum_dashboard(
+                        &self.shared.config,
+                        &message.chat,
+                        message.message_thread_id,
+                    ) {
+                        self.send_status(
+                            message.chat.id,
+                            message.message_thread_id,
+                            "This is the environments dashboard, not a work topic.\n\nOpen a topic from `/sessions` or `/environments`, then run `/status` there.",
+                        )
+                        .await?;
+                    } else {
+                        let session = self.ensure_session(session_key, user.tg_user_id)?;
+                        self.send_status(
+                            message.chat.id,
+                            message.message_thread_id,
+                            &format_session_status(&session, &message.chat),
                         )
                         .await?;
                     }

@@ -35,9 +35,6 @@ pub(super) fn command_uses_session_context(parsed: &ParsedInput) -> bool {
                 | BridgeCommand::Review(_)
                 | BridgeCommand::Cd { .. }
                 | BridgeCommand::Pwd
-                | BridgeCommand::Environments
-                | BridgeCommand::Sessions
-                | BridgeCommand::Stop
                 | BridgeCommand::Model { .. }
                 | BridgeCommand::Think { .. }
                 | BridgeCommand::Prompt { .. }

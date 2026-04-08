@@ -26,6 +26,7 @@ pub enum BridgeCommand {
     Pwd,
     Environments,
     Sessions,
+    Status,
     Stop,
     Allow { user_id: i64 },
     Deny { user_id: i64 },
@@ -46,7 +47,6 @@ pub enum BridgeCommand {
 
 const FORWARDED_COMMANDS: &[&str] = &[
     "/help",
-    "/status",
     "/doctor",
     "/prompts",
     "/memory",
@@ -98,6 +98,7 @@ pub fn parse_command(command: &str, args: &str, original_text: &str) -> Result<P
         "/pwd" => BridgeCommand::Pwd,
         "/environments" | "/envs" => BridgeCommand::Environments,
         "/sessions" => BridgeCommand::Sessions,
+        "/status" => BridgeCommand::Status,
         "/stop" => BridgeCommand::Stop,
         "/allow" => BridgeCommand::Allow {
             user_id: parse_i64_arg(args, "/allow <tg_user_id>")?,
@@ -454,7 +455,7 @@ mod tests {
     fn default_bot_commands_are_parseable() {
         let cases = [
             ("/help", ParsedInputKind::Forward),
-            ("/status", ParsedInputKind::Forward),
+            ("/status", ParsedInputKind::Bridge),
             ("/login", ParsedInputKind::Bridge),
             ("/logout", ParsedInputKind::Bridge),
             ("/new test", ParsedInputKind::Bridge),
