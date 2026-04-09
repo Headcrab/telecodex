@@ -370,6 +370,17 @@ impl App {
             }
             return Ok(());
         }
+        if let Some((thread_id, index)) = parse_history_callback_data(&data) {
+            self.render_history_page(
+                message.chat.id,
+                message.message_thread_id,
+                message.message_id,
+                &thread_id,
+                index,
+            )
+            .await?;
+            return Ok(());
+        }
         if let Some(environment_thread_id) = data.strip_prefix("env:") {
             self.ensure_environment_topic(
                 &message.chat,
@@ -699,8 +710,42 @@ impl App {
                             message.message_thread_id,
                             &body,
                             codex_sessions_keyboard(&session, &sessions),
+                        )
+                        .await?;
+                    }
+                }
+                BridgeCommand::History => {
+                    if is_primary_forum_dashboard(
+                        &self.shared.config,
+                        &message.chat,
+                        message.message_thread_id,
+                    ) {
+                        self.send_status(
+                            message.chat.id,
+                            message.message_thread_id,
+                            "This is the environments dashboard, not a work topic.\n\nOpen a topic from `/sessions` or `/environments`, then run `/history` there.",
+                        )
+                        .await?;
+                    } else {
+                        let session = self.ensure_session(session_key, user.tg_user_id)?;
+                        let session = self.resolve_session_codex_binding(session)?;
+                        let Some(thread_id) = session.codex_thread_id.as_deref() else {
+                            self.send_status(
+                                message.chat.id,
+                                message.message_thread_id,
+                                "No Codex session is selected for this topic yet.\n\nUse `/use <thread_id_prefix|latest>` or send a prompt first.",
                             )
                             .await?;
+                            return Ok(());
+                        };
+                        self.render_history_page(
+                            message.chat.id,
+                            message.message_thread_id,
+                            0,
+                            thread_id,
+                            0,
+                        )
+                        .await?;
                     }
                 }
                 BridgeCommand::Status => {
@@ -1359,6 +1404,43 @@ impl App {
             false
         }
     }
+
+    async fn render_history_page(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        message_id: i64,
+        codex_thread_id: &str,
+        requested_index: usize,
+    ) -> Result<()> {
+        let history = read_thread_history(&default_codex_home(), codex_thread_id, usize::MAX)?;
+        if history.is_empty() {
+            let body = format!(
+                "No local history found for Codex session `{}`.",
+                short_codex_thread_id(codex_thread_id)
+            );
+            if message_id > 0 {
+                self.edit_markdown_message(chat_id, message_id, &body, None)
+                    .await?;
+            } else {
+                self.send_status(chat_id, thread_id, &body).await?;
+            }
+            return Ok(());
+        }
+
+        let index = requested_index.min(history.len().saturating_sub(1));
+        let title = history_thread_title(codex_thread_id);
+        let body = format_history_page(&title, codex_thread_id, index, history.len(), &history[index]);
+        let keyboard = history_keyboard(codex_thread_id, index, history.len());
+        if message_id > 0 {
+            self.edit_markdown_message(chat_id, message_id, &body, keyboard)
+                .await
+        } else {
+            send_markdown_message(&self.shared.telegram, chat_id, thread_id, &body, keyboard)
+                .await
+                .map(|_| ())
+        }
+    }
 }
 
 fn latest_assistant_text_from_history(history: &[CodexHistoryEntry]) -> Option<&str> {
@@ -1367,6 +1449,15 @@ fn latest_assistant_text_from_history(history: &[CodexHistoryEntry]) -> Option<&
         .rev()
         .find(|entry| entry.role.eq_ignore_ascii_case("assistant"))
         .map(|entry| entry.text.as_str())
+}
+
+fn history_thread_title(thread_id: &str) -> String {
+    find_thread_by_id(&default_codex_home(), thread_id)
+        .ok()
+        .flatten()
+        .map(|summary| summary.title)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| short_codex_thread_id(thread_id))
 }
 
 #[cfg(test)]

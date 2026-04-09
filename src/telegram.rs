@@ -626,6 +626,8 @@ pub struct EditMessageText {
     pub parse_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_preview_options: Option<LinkPreviewOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -689,6 +691,7 @@ impl EditMessageText {
             text,
             parse_mode: "HTML".to_string(),
             link_preview_options: Some(LinkPreviewOptions { is_disabled: true }),
+            reply_markup: None,
         }
     }
 }

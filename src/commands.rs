@@ -26,6 +26,7 @@ pub enum BridgeCommand {
     Pwd,
     Environments,
     Sessions,
+    History,
     Status,
     Stop,
     Allow { user_id: i64 },
@@ -98,6 +99,7 @@ pub fn parse_command(command: &str, args: &str, original_text: &str) -> Result<P
         "/pwd" => BridgeCommand::Pwd,
         "/environments" | "/envs" => BridgeCommand::Environments,
         "/sessions" => BridgeCommand::Sessions,
+        "/history" => BridgeCommand::History,
         "/status" => BridgeCommand::Status,
         "/stop" => BridgeCommand::Stop,
         "/allow" => BridgeCommand::Allow {
@@ -216,6 +218,9 @@ pub fn command_help(command: &str, args: &str) -> Option<CommandHelp> {
         "/use" => Some(text_help(
             "Usage: /use <thread_id_prefix|latest>\n\nExamples:\n/use latest\n/use 019ce672",
         )),
+        "/history" => Some(text_help(
+            "Usage: /history\n\nShows an interactive pager for messages from the selected Codex session.",
+        )),
         "/add-dir" | "/add_dir" => Some(text_help(
             "Usage: /add-dir <absolute_path>\n\nExample:\n/add-dir /absolute/path/to/workspace",
         )),
@@ -247,6 +252,7 @@ pub fn default_bot_commands() -> Vec<BotCommand> {
         bot_command("review", "Run codex review"),
         bot_command("environments", "Show importable Codex environments"),
         bot_command("sessions", "List sessions in this chat"),
+        bot_command("history", "Browse messages in the selected Codex session"),
         bot_command("copy", "Resend the last assistant reply"),
         bot_command("clear", "Start a fresh Codex session on the next turn"),
         bot_command("stop", "Stop the active turn"),
@@ -473,6 +479,7 @@ mod tests {
             ("/review --uncommitted", ParsedInputKind::Bridge),
             ("/environments", ParsedInputKind::Bridge),
             ("/sessions", ParsedInputKind::Bridge),
+            ("/history", ParsedInputKind::Bridge),
             ("/copy", ParsedInputKind::Bridge),
             ("/clear", ParsedInputKind::Bridge),
             ("/stop", ParsedInputKind::Bridge),

@@ -58,6 +58,16 @@ pub(super) fn parse_approval_callback_data(data: &str) -> Option<(String, CodexA
     Some((token, decision))
 }
 
+pub(super) fn parse_history_callback_data(data: &str) -> Option<(String, usize)> {
+    let mut parts = data.split(':');
+    if parts.next()? != "his" {
+        return None;
+    }
+    let thread_id = parts.next()?.to_string();
+    let index = parts.next()?.parse::<usize>().ok()?;
+    Some((thread_id, index))
+}
+
 pub(super) fn approval_keyboard(
     token: &str,
     options: &[CodexApprovalDecision],
@@ -79,6 +89,40 @@ pub(super) fn approval_keyboard(
         .map(|chunk| chunk.to_vec())
         .collect::<Vec<_>>();
     Some(InlineKeyboardMarkup { inline_keyboard })
+}
+
+pub(super) fn history_keyboard(
+    thread_id: &str,
+    index: usize,
+    total: usize,
+) -> Option<InlineKeyboardMarkup> {
+    if total == 0 {
+        return None;
+    }
+    let current = index.min(total.saturating_sub(1));
+    let mut row = Vec::new();
+    if current > 0 {
+        row.push(InlineKeyboardButton {
+            text: "Prev".to_string(),
+            callback_data: Some(format!("his:{thread_id}:{}", current - 1)),
+            url: None,
+        });
+    }
+    row.push(InlineKeyboardButton {
+        text: format!("{}/{}", current + 1, total),
+        callback_data: Some(format!("his:{thread_id}:{current}")),
+        url: None,
+    });
+    if current + 1 < total {
+        row.push(InlineKeyboardButton {
+            text: "Next".to_string(),
+            callback_data: Some(format!("his:{thread_id}:{}", current + 1)),
+            url: None,
+        });
+    }
+    Some(InlineKeyboardMarkup {
+        inline_keyboard: vec![row],
+    })
 }
 
 pub(super) async fn send_markdown_message(
@@ -751,6 +795,39 @@ pub(super) fn format_session_status(
         session.sandbox_mode,
         session.search_mode.as_codex_value(),
     )
+}
+
+pub(super) fn format_history_page(
+    thread_title: &str,
+    thread_id: &str,
+    index: usize,
+    total: usize,
+    entry: &CodexHistoryEntry,
+) -> String {
+    let thread_title = escape_markdown_label(thread_title.trim());
+    let role = escape_markdown_label(&entry.role);
+    let timestamp = escape_markdown_label(&entry.timestamp);
+    format!(
+        "**Session history**\n- codex session title: {thread_title}\n- codex thread: `{}`\n- message: `{}/{}`\n- role: `{role}`\n- time: `{timestamp}`\n\n```text\n{}\n```",
+        short_codex_thread_id(thread_id),
+        index + 1,
+        total,
+        truncate_history_page_text(&entry.text),
+    )
+}
+
+fn truncate_history_page_text(text: &str) -> String {
+    const MAX_CHARS: usize = 3200;
+    let normalized = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace("```", "'''");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut truncated = normalized.chars().take(MAX_CHARS).collect::<String>();
+    truncated.push_str("\n...");
+    truncated
 }
 
 pub(super) fn environment_topic_name(environment: &CodexEnvironmentSummary) -> String {

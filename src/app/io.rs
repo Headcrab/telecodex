@@ -1,5 +1,7 @@
 use super::presentation::quick_reply_keyboard;
-use super::support::{is_message_thread_not_found, should_drop_telegram_rate_limited_send};
+use super::support::{
+    is_message_not_modified, is_message_thread_not_found, should_drop_telegram_rate_limited_send,
+};
 use super::turns::{classify_document_kind, sanitize_file_name};
 use super::*;
 
@@ -287,6 +289,46 @@ impl App {
                     }
                 }
                 Ok(())
+            }
+        }
+    }
+
+    pub(super) async fn edit_markdown_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        markdown: &str,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<()> {
+        let html = render_markdown_to_html(markdown);
+        let mut request = EditMessageText::html(chat_id, message_id, html);
+        request.reply_markup = reply_markup.clone();
+        match self.shared.telegram.edit_message_text(request).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if is_message_not_modified(&error) {
+                    return Ok(());
+                }
+                if should_drop_telegram_rate_limited_send(&error) {
+                    tracing::warn!("dropping edit due to Telegram rate limit");
+                    return Ok(());
+                }
+                let fallback = html_escape::encode_safe(markdown).to_string();
+                let mut fallback_request = EditMessageText::html(chat_id, message_id, fallback);
+                fallback_request.reply_markup = reply_markup;
+                match self.shared.telegram.edit_message_text(fallback_request).await {
+                    Ok(_) => Ok(()),
+                    Err(fallback_error) if is_message_not_modified(&fallback_error) => Ok(()),
+                    Err(fallback_error)
+                        if should_drop_telegram_rate_limited_send(&fallback_error) =>
+                    {
+                        tracing::warn!("dropping fallback edit due to Telegram rate limit");
+                        Ok(())
+                    }
+                    Err(fallback_error) => Err(fallback_error).with_context(|| {
+                        format!("failed to edit message after html fallback: {error:#}")
+                    }),
+                }
             }
         }
     }
