@@ -13,7 +13,7 @@ pub(super) fn environment_sync_thread_binding<'a>(
     session: &crate::models::SessionRecord,
     environment: &'a CodexEnvironmentSummary,
 ) -> Option<&'a str> {
-    if session.codex_thread_id.is_some() {
+    if session.codex_thread_id.is_some() || session.force_fresh_thread {
         return None;
     }
     environment.latest_thread_id.as_deref()

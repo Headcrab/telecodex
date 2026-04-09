@@ -330,6 +330,38 @@ fn forum_sync_seeds_unbound_environment_session() {
 }
 
 #[test]
+fn forum_sync_preserves_fresh_thread_request() {
+    let session = crate::models::SessionRecord {
+        id: 1,
+        key: SessionKey::new(-1001234567890, Some(323)),
+        session_title: Some("kombez".to_string()),
+        codex_thread_id: None,
+        force_fresh_thread: true,
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+        cwd: sample_workspace(),
+        model: None,
+        reasoning_effort: None,
+        session_prompt: None,
+        sandbox_mode: "workspace-write".to_string(),
+        approval_policy: "never".to_string(),
+        search_mode: SearchMode::Disabled,
+        add_dirs: vec![],
+        busy: false,
+    };
+    let environment = crate::codex_history::CodexEnvironmentSummary {
+        cwd: sample_workspace(),
+        name: "kombez".to_string(),
+        latest_thread_id: Some("latest-thread".to_string()),
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+    };
+
+    assert_eq!(
+        super::forum::environment_sync_thread_binding(&session, &environment),
+        None
+    );
+}
+
+#[test]
 fn picks_last_assistant_text_from_history() {
     let history = vec![
         crate::codex_history::CodexHistoryEntry {
