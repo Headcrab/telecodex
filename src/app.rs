@@ -1414,9 +1414,10 @@ impl App {
         requested_index: usize,
     ) -> Result<()> {
         let history = read_thread_history(&default_codex_home(), codex_thread_id, usize::MAX)?;
-        if history.is_empty() {
+        let pages = assistant_history_pages(&history);
+        if pages.is_empty() {
             let body = format!(
-                "No local history found for Codex session `{}`.",
+                "No final assistant messages found for Codex session `{}`.",
                 short_codex_thread_id(codex_thread_id)
             );
             if message_id > 0 {
@@ -1428,10 +1429,11 @@ impl App {
             return Ok(());
         }
 
-        let index = requested_index.min(history.len().saturating_sub(1));
+        let index = requested_index % pages.len();
         let title = history_thread_title(codex_thread_id);
-        let body = format_history_page(&title, codex_thread_id, index, history.len(), &history[index]);
-        let keyboard = history_keyboard(codex_thread_id, index, history.len());
+        let body =
+            format_history_page(&title, codex_thread_id, index, pages.len(), &pages[index]);
+        let keyboard = history_keyboard(codex_thread_id, index, pages.len());
         if message_id > 0 {
             self.edit_markdown_message(chat_id, message_id, &body, keyboard)
                 .await
@@ -1458,6 +1460,16 @@ fn history_thread_title(thread_id: &str) -> String {
         .map(|summary| summary.title)
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| short_codex_thread_id(thread_id))
+}
+
+fn assistant_history_pages(history: &[CodexHistoryEntry]) -> Vec<CodexHistoryEntry> {
+    let mut pages = history
+        .iter()
+        .filter(|entry| entry.role.eq_ignore_ascii_case("assistant"))
+        .cloned()
+        .collect::<Vec<_>>();
+    pages.reverse();
+    pages
 }
 
 #[cfg(test)]

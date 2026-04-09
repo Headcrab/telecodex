@@ -99,27 +99,24 @@ pub(super) fn history_keyboard(
     if total == 0 {
         return None;
     }
-    let current = index.min(total.saturating_sub(1));
-    let mut row = Vec::new();
-    if current > 0 {
-        row.push(InlineKeyboardButton {
-            text: "Prev".to_string(),
-            callback_data: Some(format!("his:{thread_id}:{}", current - 1)),
-            url: None,
-        });
-    }
+    let current = index % total;
+    let previous = if current == 0 { total - 1 } else { current - 1 };
+    let next = (current + 1) % total;
+    let mut row = vec![InlineKeyboardButton {
+        text: "Prev".to_string(),
+        callback_data: Some(format!("his:{thread_id}:{previous}")),
+        url: None,
+    }];
     row.push(InlineKeyboardButton {
         text: format!("{}/{}", current + 1, total),
         callback_data: Some(format!("his:{thread_id}:{current}")),
         url: None,
     });
-    if current + 1 < total {
-        row.push(InlineKeyboardButton {
-            text: "Next".to_string(),
-            callback_data: Some(format!("his:{thread_id}:{}", current + 1)),
-            url: None,
-        });
-    }
+    row.push(InlineKeyboardButton {
+        text: "Next".to_string(),
+        callback_data: Some(format!("his:{thread_id}:{next}")),
+        url: None,
+    });
     Some(InlineKeyboardMarkup {
         inline_keyboard: vec![row],
     })

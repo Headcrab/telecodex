@@ -385,6 +385,38 @@ fn picks_last_assistant_text_from_history() {
 }
 
 #[test]
+fn assistant_history_pages_keep_only_assistant_messages_and_start_latest() {
+    let history = vec![
+        crate::codex_history::CodexHistoryEntry {
+            role: "user".to_string(),
+            text: "u1".to_string(),
+            timestamp: "2026-03-13T09:00:00Z".to_string(),
+        },
+        crate::codex_history::CodexHistoryEntry {
+            role: "assistant".to_string(),
+            text: "a1".to_string(),
+            timestamp: "2026-03-13T09:00:01Z".to_string(),
+        },
+        crate::codex_history::CodexHistoryEntry {
+            role: "user".to_string(),
+            text: "u2".to_string(),
+            timestamp: "2026-03-13T09:00:02Z".to_string(),
+        },
+        crate::codex_history::CodexHistoryEntry {
+            role: "assistant".to_string(),
+            text: "a2".to_string(),
+            timestamp: "2026-03-13T09:00:03Z".to_string(),
+        },
+    ];
+
+    let pages = assistant_history_pages(&history);
+
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0].text, "a2");
+    assert_eq!(pages[1].text, "a1");
+}
+
+#[test]
 fn builds_import_button_for_seed_environment() {
     let session = crate::models::SessionRecord {
         id: 1,
@@ -839,6 +871,21 @@ fn builds_history_keyboard_buttons() {
     assert_eq!(
         keyboard.inline_keyboard[0][2].callback_data,
         Some("his:019ce672-9445-7612-bc5e-c8243a0d1915:2".to_string())
+    );
+}
+
+#[test]
+fn history_keyboard_wraps_around() {
+    let keyboard =
+        history_keyboard("019ce672-9445-7612-bc5e-c8243a0d1915", 0, 3).expect("history keyboard");
+
+    assert_eq!(
+        keyboard.inline_keyboard[0][0].callback_data,
+        Some("his:019ce672-9445-7612-bc5e-c8243a0d1915:2".to_string())
+    );
+    assert_eq!(
+        keyboard.inline_keyboard[0][2].callback_data,
+        Some("his:019ce672-9445-7612-bc5e-c8243a0d1915:1".to_string())
     );
 }
 
