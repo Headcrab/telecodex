@@ -9,6 +9,16 @@ use super::support::{
 };
 use super::*;
 
+pub(super) fn environment_sync_thread_binding<'a>(
+    session: &crate::models::SessionRecord,
+    environment: &'a CodexEnvironmentSummary,
+) -> Option<&'a str> {
+    if session.codex_thread_id.is_some() {
+        return None;
+    }
+    environment.latest_thread_id.as_deref()
+}
+
 impl App {
     pub(super) async fn ensure_environment_topic(
         &self,
@@ -94,7 +104,7 @@ impl App {
         self.shared
             .store
             .set_session_title(session.key, Some(&environment.name))?;
-        if let Some(thread_id) = environment.latest_thread_id.as_deref() {
+        if let Some(thread_id) = environment_sync_thread_binding(session, environment) {
             self.shared
                 .store
                 .set_session_codex_thread(session.key, thread_id)?;

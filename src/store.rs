@@ -410,7 +410,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_last_assistant_text(&self, key: SessionKey, text: &str) -> Result<()> {
+    pub fn set_last_assistant_text(&self, key: SessionKey, text: Option<&str>) -> Result<()> {
         self.update_session_field(
             key,
             "UPDATE sessions SET last_assistant_text = ?3, updated_at = ?4 WHERE chat_id = ?1 AND thread_id = ?2",

@@ -558,6 +558,10 @@ impl App {
                     )
                     .await?;
                     let history = read_thread_history(&default_codex_home(), &summary.id, 6)?;
+                    self.shared.store.set_last_assistant_text(
+                        session.key,
+                        latest_assistant_text_from_history(&history),
+                    )?;
                     if !history.is_empty() {
                         self.send_html_status(
                             message.chat.id,
@@ -1298,7 +1302,7 @@ impl App {
             chat.id,
             Some(session_key.thread_id).filter(|value| *value != 0),
             &format!(
-                "Current session: **{}**",
+                "Current Codex session: **{}**",
                 escape_markdown_label(&current_session_label(session, chat))
             ),
         )
@@ -1355,6 +1359,14 @@ impl App {
             false
         }
     }
+}
+
+fn latest_assistant_text_from_history(history: &[CodexHistoryEntry]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|entry| entry.role.eq_ignore_ascii_case("assistant"))
+        .map(|entry| entry.text.as_str())
 }
 
 #[cfg(test)]

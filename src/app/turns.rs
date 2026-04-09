@@ -258,7 +258,7 @@ where
         }
         context
             .store
-            .set_last_assistant_text(context.session.key, &context.summary.assistant_text)?;
+            .set_last_assistant_text(context.session.key, Some(&context.summary.assistant_text))?;
         send_artifacts()
             .await
             .context("failed to deliver generated artifacts")?;

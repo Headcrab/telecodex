@@ -721,7 +721,8 @@ pub(super) fn format_session_status(
     session: &crate::models::SessionRecord,
     chat: &crate::telegram::Chat,
 ) -> String {
-    let title = escape_markdown_label(&current_session_label(session, chat));
+    let telegram_title = escape_markdown_label(&session_title_label(session, chat));
+    let codex_title = escape_markdown_label(&current_session_label(session, chat));
     let state = if session.busy { "busy" } else { "idle" };
     let codex_thread = session
         .codex_thread_id
@@ -743,7 +744,7 @@ pub(super) fn format_session_status(
     };
 
     format!(
-        "**Current session:** {title}\n- state: `{state}`\n- cwd: `{}`\n- codex thread: `{}`\n- model: `{model}`\n- reasoning: `{reasoning}`\n- approval: `{}`\n- sandbox: `{}`\n- search: `{}`\n- prompt: `{prompt}`",
+        "**Current Telegram session:** {telegram_title}\n- codex session title: {codex_title}\n- state: `{state}`\n- cwd: `{}`\n- codex thread: `{}`\n- model: `{model}`\n- reasoning: `{reasoning}`\n- approval: `{}`\n- sandbox: `{}`\n- search: `{}`\n- prompt: `{prompt}`",
         session.cwd.display(),
         codex_thread,
         session.approval_policy,

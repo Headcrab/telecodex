@@ -266,6 +266,93 @@ fn session_environment_match_requires_same_title_and_cwd() {
 }
 
 #[test]
+fn forum_sync_preserves_manual_codex_binding() {
+    let session = crate::models::SessionRecord {
+        id: 1,
+        key: SessionKey::new(-1001234567890, Some(323)),
+        session_title: Some("kombez".to_string()),
+        codex_thread_id: Some("manual-thread".to_string()),
+        force_fresh_thread: false,
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+        cwd: sample_workspace(),
+        model: None,
+        reasoning_effort: None,
+        session_prompt: None,
+        sandbox_mode: "workspace-write".to_string(),
+        approval_policy: "never".to_string(),
+        search_mode: SearchMode::Disabled,
+        add_dirs: vec![],
+        busy: false,
+    };
+    let environment = crate::codex_history::CodexEnvironmentSummary {
+        cwd: sample_workspace(),
+        name: "kombez".to_string(),
+        latest_thread_id: Some("latest-thread".to_string()),
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+    };
+
+    assert_eq!(
+        super::forum::environment_sync_thread_binding(&session, &environment),
+        None
+    );
+}
+
+#[test]
+fn forum_sync_seeds_unbound_environment_session() {
+    let session = crate::models::SessionRecord {
+        id: 1,
+        key: SessionKey::new(-1001234567890, Some(323)),
+        session_title: Some("kombez".to_string()),
+        codex_thread_id: None,
+        force_fresh_thread: false,
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+        cwd: sample_workspace(),
+        model: None,
+        reasoning_effort: None,
+        session_prompt: None,
+        sandbox_mode: "workspace-write".to_string(),
+        approval_policy: "never".to_string(),
+        search_mode: SearchMode::Disabled,
+        add_dirs: vec![],
+        busy: false,
+    };
+    let environment = crate::codex_history::CodexEnvironmentSummary {
+        cwd: sample_workspace(),
+        name: "kombez".to_string(),
+        latest_thread_id: Some("latest-thread".to_string()),
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+    };
+
+    assert_eq!(
+        super::forum::environment_sync_thread_binding(&session, &environment),
+        Some("latest-thread")
+    );
+}
+
+#[test]
+fn picks_last_assistant_text_from_history() {
+    let history = vec![
+        crate::codex_history::CodexHistoryEntry {
+            role: "user".to_string(),
+            text: "first".to_string(),
+            timestamp: "2026-03-13T09:00:00Z".to_string(),
+        },
+        crate::codex_history::CodexHistoryEntry {
+            role: "assistant".to_string(),
+            text: "alpha".to_string(),
+            timestamp: "2026-03-13T09:00:01Z".to_string(),
+        },
+        crate::codex_history::CodexHistoryEntry {
+            role: "assistant".to_string(),
+            text: "beta".to_string(),
+            timestamp: "2026-03-13T09:00:02Z".to_string(),
+        },
+    ];
+
+    assert_eq!(latest_assistant_text_from_history(&history), Some("beta"));
+}
+
+#[test]
 fn builds_import_button_for_seed_environment() {
     let session = crate::models::SessionRecord {
         id: 1,
