@@ -371,6 +371,19 @@ impl App {
             return Ok(());
         }
         if let Some((thread_id, index)) = parse_history_callback_data(&data) {
+            let session_key = SessionKey::new(message.chat.id, message.message_thread_id);
+            let session = self.ensure_resolved_session(session_key, user.tg_user_id)?;
+            if !history_callback_matches_current_session(&session, &thread_id) {
+                self.render_stale_history_page(
+                    message.chat.id,
+                    message.message_thread_id,
+                    message.message_id,
+                    &session,
+                    &thread_id,
+                )
+                .await?;
+                return Ok(());
+            }
             self.render_history_page(
                 message.chat.id,
                 message.message_thread_id,
@@ -476,8 +489,7 @@ impl App {
             return Ok(true);
         }
         if command_uses_session_context(&parsed) {
-            let session = self.ensure_session(session_key, user.tg_user_id)?;
-            let session = self.resolve_session_codex_binding(session)?;
+            let session = self.ensure_resolved_session(session_key, user.tg_user_id)?;
             self.announce_session_if_switched(
                 user.tg_user_id,
                 &message.chat,
@@ -727,8 +739,7 @@ impl App {
                         )
                         .await?;
                     } else {
-                        let session = self.ensure_session(session_key, user.tg_user_id)?;
-                        let session = self.resolve_session_codex_binding(session)?;
+                        let session = self.ensure_resolved_session(session_key, user.tg_user_id)?;
                         let Some(thread_id) = session.codex_thread_id.as_deref() else {
                             self.send_status(
                                 message.chat.id,
@@ -761,7 +772,7 @@ impl App {
                         )
                         .await?;
                     } else {
-                        let session = self.ensure_session(session_key, user.tg_user_id)?;
+                        let session = self.ensure_resolved_session(session_key, user.tg_user_id)?;
                         self.send_status(
                             message.chat.id,
                             message.message_thread_id,
@@ -1283,6 +1294,15 @@ impl App {
             .ok_or_else(|| anyhow!("failed to reload ensured session"))
     }
 
+    fn ensure_resolved_session(
+        &self,
+        session_key: SessionKey,
+        user_id: i64,
+    ) -> Result<crate::models::SessionRecord> {
+        let session = self.ensure_session(session_key, user_id)?;
+        self.resolve_session_codex_binding(session)
+    }
+
     fn maybe_assign_session_title_from_text(
         &self,
         session: crate::models::SessionRecord,
@@ -1431,8 +1451,7 @@ impl App {
 
         let index = requested_index % pages.len();
         let title = history_thread_title(codex_thread_id);
-        let body =
-            format_history_page(&title, codex_thread_id, index, pages.len(), &pages[index]);
+        let body = format_history_page(&title, codex_thread_id, index, pages.len(), &pages[index]);
         let keyboard = history_keyboard(codex_thread_id, index, pages.len());
         if message_id > 0 {
             self.edit_markdown_message(chat_id, message_id, &body, keyboard)
@@ -1441,6 +1460,23 @@ impl App {
             send_markdown_message(&self.shared.telegram, chat_id, thread_id, &body, keyboard)
                 .await
                 .map(|_| ())
+        }
+    }
+
+    async fn render_stale_history_page(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        message_id: i64,
+        session: &crate::models::SessionRecord,
+        requested_thread_id: &str,
+    ) -> Result<()> {
+        let body = format_stale_history_page(session, requested_thread_id);
+        if message_id > 0 {
+            self.edit_markdown_message(chat_id, message_id, &body, None)
+                .await
+        } else {
+            self.send_status(chat_id, thread_id, &body).await
         }
     }
 }
@@ -1470,6 +1506,29 @@ fn assistant_history_pages(history: &[CodexHistoryEntry]) -> Vec<CodexHistoryEnt
         .collect::<Vec<_>>();
     pages.reverse();
     pages
+}
+
+fn history_callback_matches_current_session(
+    session: &crate::models::SessionRecord,
+    requested_thread_id: &str,
+) -> bool {
+    session.codex_thread_id.as_deref() == Some(requested_thread_id)
+}
+
+fn format_stale_history_page(
+    session: &crate::models::SessionRecord,
+    requested_thread_id: &str,
+) -> String {
+    let requested = short_codex_thread_id(requested_thread_id);
+    match session.codex_thread_id.as_deref() {
+        Some(current) => format!(
+            "This `/history` view is stale.\n\nIt still points to Codex session `{requested}`, but this topic is now bound to `{}`.\n\nRun `/history` again to browse the currently selected session.",
+            short_codex_thread_id(current)
+        ),
+        None => format!(
+            "This `/history` view is stale.\n\nIt still points to Codex session `{requested}`, but this topic no longer has a selected Codex session.\n\nRun `/use <thread_id_prefix|latest>` or send a prompt, then run `/history` again."
+        ),
+    }
 }
 
 #[cfg(test)]

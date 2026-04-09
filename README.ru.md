@@ -58,7 +58,7 @@
 - Поллит Telegram Bot API через `getUpdates`.
 - Держит одну логическую сессию на пару chat/topic.
 - Ставит ходы в очередь по сессии и стримит прогресс через редактирование сообщений.
-- Поддерживает `/new`, `/environments`, `/sessions`, `/use`, `/clear`, `/stop` и настройки рантайма на уровне сессии.
+- Поддерживает `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop` и настройки рантайма на уровне сессии.
 - Может привязать Telegram topic к существующему Codex thread по id или `latest`.
 - В primary forum dashboard окружения показываются для импорта, а topic создаётся по нажатию кнопки по умолчанию.
 
@@ -91,11 +91,12 @@
 - Неавторизованные попытки игнорируются и пишутся в `audit_log`.
 - Поддерживаются дефолты Codex для sandbox, approval policy, search mode и writable directories.
 - Поддерживается headless device login в Codex через Telegram-команды `/login` и `/logout`.
-- Если Codex не залогинен, Telecodex не запускает ходы и не пробрасывает `/status`, а просит сначала авторизоваться.
+- Если Codex не залогинен, Telecodex не запускает ходы и не пробрасывает Codex-native slash-команды, а просит сначала авторизоваться.
 
 ### История и синхронизация topic'ов
 
 - Читает локальную историю Codex и импортирует существующие сессии по `cwd`.
+- Может листать итоговые сообщения ассистента из выбранной Codex-сессии через интерактивный pager.
 - Может синхронизировать forum topics из истории Codex Desktop и/или CLI.
 - Умеет направлять создание новых topic'ов в отдельный Telegram forum chat.
 - Поддерживает очистку старых topic'ов по таймеру.
@@ -138,7 +139,9 @@ Telegram chat/topic
 | `/cd <absolute_path>` | Поменять рабочую директорию сессии |
 | `/pwd` | Показать текущую рабочую директорию |
 | `/environments` | Показать доступные для импорта Codex environments в primary forum dashboard |
-| `/sessions` | Показать сессии в текущем чате |
+| `/sessions` | Показать topic-сессии в корне dashboard или Codex-сессии для текущего `cwd` внутри рабочего topic |
+| `/history` | Листать итоговые сообщения ассистента из выбранной Codex-сессии через интерактивный pager |
+| `/status` | Показать текущую Telegram-сессию, выбранную Codex-сессию и runtime-настройки |
 | `/stop` | Остановить активный ход |
 | `/model [model\|default\|-]` | Поставить или показать модель |
 | `/think [minimal\|low\|medium\|high\|default\|-]` | Поставить или показать reasoning effort |
@@ -157,7 +160,7 @@ Telegram chat/topic
 
 ### Команды, которые пробрасываются в Codex как есть
 
-`/help`, `/status`, `/doctor`, `/prompts`, `/memory`, `/mentions`, `/init`, `/bug`, `/config`, `/compact`, `/agents`, `/diff`
+`/help`, `/doctor`, `/prompts`, `/memory`, `/mentions`, `/init`, `/bug`, `/config`, `/compact`, `/agents`, `/diff`
 
 Эти команды требуют активной авторизации в Codex. Если локальный Codex CLI ещё не залогинен, Telecodex не будет их пробрасывать и попросит выполнить `/login`.
 
@@ -331,17 +334,19 @@ task run CONFIG=telecodex.toml
 
 - Неавторизованные апдейты игнорируются и пишутся в `audit_log`.
 - Существующая история Codex может автоматически подтягиваться по `cwd`, если не был вызван `/clear`.
-- `/sessions` показывает сессии для текущего Telegram chat/topic контекста.
+- `/sessions` контекстная команда: в корне dashboard она показывает Telegram topic-сессии, а внутри рабочего topic показывает Codex-сессии для текущего `cwd`.
+- `/history` листает итоговые сообщения ассистента из выбранной Codex-сессии, начинает с самого нового и циклически переходит через края списка.
 - В primary forum dashboard `/environments` показывает доступные для импорта окружения и создаёт topic только по нажатию кнопки, если не включён `telegram.auto_create_topics = true`.
 - `/new` теперь сбрасывает Codex-разговор внутри текущего topic и сохраняет текущее окружение и runtime-настройки.
 - `/topic` теперь является явным способом создать новый Telegram topic из текущего окружения.
 - `/think` и `/prompt` сохраняются на уровне сессии и влияют на следующие ходы.
 - Во время работы бот шлёт Telegram chat actions вроде typing/upload.
-- В корне forum dashboard надо использовать `/topic` или `/environments`; `/new` предназначен для рабочего topic.
+- В корне forum dashboard надо использовать `/environments` или `/sessions`; `/status`, `/history`, `/new` и обычные промпты предназначены для рабочего topic.
 - `/login` запускает headless device authentication и присылает кликабельную auth-ссылку и одноразовый код inline в сообщении.
 - Если device-code endpoint отвечает `429 Too Many Requests`, бот пишет об этом в чат и включает короткий локальный backoff перед следующей попыткой `/login`.
 - После `/logout` бот остаётся доступным и продолжает подсказывать `/login`, а не замолкает.
-- Если Codex не залогинен, Telecodex не запускает ходы и не пробрасывает `/status`, а просит сначала авторизоваться.
+- `/status` обрабатывается самим Telecodex и показывает текущую Telegram-сессию, выбранную Codex-сессию и runtime-настройки.
+- Если Codex не залогинен, Telecodex не запускает ходы и не пробрасывает Codex-native slash-команды, а просит сначала авторизоваться.
 - Если в промпте явно просят свежую инфу вроде "today", "latest" или "news", Telecodex может автоматически включить live search для этого хода.
 
 ## 📄 Лицензия

@@ -212,8 +212,7 @@ fn builds_topic_links_for_dashboard_root_sessions_keyboard() {
     };
 
     let keyboard =
-        chat_sessions_keyboard(&root_session, &chat, std::slice::from_ref(&topic_session))
-            .unwrap();
+        chat_sessions_keyboard(&root_session, &chat, std::slice::from_ref(&topic_session)).unwrap();
 
     assert_eq!(keyboard.inline_keyboard[0][0].callback_data, None);
     assert_eq!(
@@ -414,6 +413,89 @@ fn assistant_history_pages_keep_only_assistant_messages_and_start_latest() {
     assert_eq!(pages.len(), 2);
     assert_eq!(pages[0].text, "a2");
     assert_eq!(pages[1].text, "a1");
+}
+
+#[test]
+fn history_callback_matches_only_current_session_binding() {
+    let session = crate::models::SessionRecord {
+        id: 1,
+        key: SessionKey::new(1, Some(2)),
+        session_title: Some("kombez".to_string()),
+        codex_thread_id: Some("019ce672-9445-7612-bc5e-c8243a0d1915".to_string()),
+        force_fresh_thread: false,
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+        cwd: sample_workspace(),
+        model: None,
+        reasoning_effort: None,
+        session_prompt: None,
+        sandbox_mode: "workspace-write".to_string(),
+        approval_policy: "never".to_string(),
+        search_mode: SearchMode::Disabled,
+        add_dirs: vec![],
+        busy: false,
+    };
+
+    assert!(history_callback_matches_current_session(
+        &session,
+        "019ce672-9445-7612-bc5e-c8243a0d1915"
+    ));
+    assert!(!history_callback_matches_current_session(
+        &session,
+        "019ce672-9445-7612-bc5e-c8243a0d1916"
+    ));
+}
+
+#[test]
+fn history_callback_rejects_unbound_fresh_session() {
+    let session = crate::models::SessionRecord {
+        id: 1,
+        key: SessionKey::new(1, Some(2)),
+        session_title: Some("kombez".to_string()),
+        codex_thread_id: None,
+        force_fresh_thread: true,
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+        cwd: sample_workspace(),
+        model: None,
+        reasoning_effort: None,
+        session_prompt: None,
+        sandbox_mode: "workspace-write".to_string(),
+        approval_policy: "never".to_string(),
+        search_mode: SearchMode::Disabled,
+        add_dirs: vec![],
+        busy: false,
+    };
+
+    assert!(!history_callback_matches_current_session(
+        &session,
+        "019ce672-9445-7612-bc5e-c8243a0d1915"
+    ));
+}
+
+#[test]
+fn formats_stale_history_page_for_rebound_topic() {
+    let session = crate::models::SessionRecord {
+        id: 1,
+        key: SessionKey::new(1, Some(2)),
+        session_title: Some("kombez".to_string()),
+        codex_thread_id: Some("019ce672-9445-7612-bc5e-c8243a0d1916".to_string()),
+        force_fresh_thread: false,
+        updated_at: "2026-03-13T10:00:00Z".to_string(),
+        cwd: sample_workspace(),
+        model: None,
+        reasoning_effort: None,
+        session_prompt: None,
+        sandbox_mode: "workspace-write".to_string(),
+        approval_policy: "never".to_string(),
+        search_mode: SearchMode::Disabled,
+        add_dirs: vec![],
+        busy: false,
+    };
+
+    let text = format_stale_history_page(&session, "019ce672-9445-7612-bc5e-c8243a0d1915");
+
+    assert!(text.contains("This `/history` view is stale."));
+    assert!(text.contains("019ce672"));
+    assert!(text.contains("Run `/history` again"));
 }
 
 #[test]
@@ -819,10 +901,7 @@ fn parses_approval_callback_payloads() {
 fn parses_history_callback_payloads() {
     assert_eq!(
         parse_history_callback_data("his:019ce672-9445-7612-bc5e-c8243a0d1915:7"),
-        Some((
-            "019ce672-9445-7612-bc5e-c8243a0d1915".to_string(),
-            7
-        ))
+        Some(("019ce672-9445-7612-bc5e-c8243a0d1915".to_string(), 7))
     );
     assert_eq!(parse_history_callback_data("his:bad"), None);
 }

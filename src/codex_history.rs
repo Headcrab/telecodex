@@ -534,13 +534,33 @@ fn history_entry_from_response_payload(
         Some("assistant") => "assistant",
         _ => return None,
     };
+    if role == "assistant" {
+        match payload.get("phase").and_then(|value| value.as_str()) {
+            Some("final_answer") | None => {}
+            _ => return None,
+        }
+    }
     let content = payload.get("content")?.as_array()?;
     let text = content
         .iter()
-        .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
+        .filter_map(|item| {
+            let kind = item.get("type").and_then(|value| value.as_str());
+            if !response_content_item_matches_role(role, kind) {
+                return None;
+            }
+            item.get("text").and_then(|value| value.as_str())
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     build_history_entry(role, &text, timestamp)
+}
+
+fn response_content_item_matches_role(role: &str, kind: Option<&str>) -> bool {
+    match role {
+        "user" => matches!(kind, Some("input_text") | None),
+        "assistant" => matches!(kind, Some("output_text") | None),
+        _ => false,
+    }
 }
 
 fn build_history_entry(role: &str, text: &str, timestamp: String) -> Option<CodexHistoryEntry> {
@@ -1142,6 +1162,62 @@ mod tests {
         assert_eq!(history[0].text, "weather");
         assert_eq!(history[1].role, "assistant");
         assert_eq!(history[1].text, "done");
+    }
+
+    #[test]
+    fn reads_recent_thread_history_from_response_messages_and_skips_commentary() {
+        let dir = tempdir().unwrap();
+        let cwd = workspace_path(dir.path(), "desktop-history");
+        let sessions_dir = dir.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            sessions_dir.join("rollout-1.jsonl"),
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-03-13T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"desktop-thread\",\"timestamp\":\"2026-03-13T09:00:00Z\",\"cwd\":\"{}\",\"source\":\"vscode\"}}}}\n",
+                    "{{\"timestamp\":\"2026-03-13T09:00:01Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"ping\"}}]}}}}\n",
+                    "{{\"timestamp\":\"2026-03-13T09:00:02Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"content\":[{{\"type\":\"output_text\",\"text\":\"working\"}}]}}}}\n",
+                    "{{\"timestamp\":\"2026-03-13T09:00:03Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{{\"type\":\"summary_text\",\"text\":\"mini\"}},{{\"type\":\"output_text\",\"text\":\"pong\"}}]}}}}\n"
+                ),
+                escaped_json_path(&cwd)
+            ),
+        )
+        .unwrap();
+
+        let history = read_thread_history(dir.path(), "desktop-thread", 10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].text, "ping");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].text, "pong");
+    }
+
+    #[test]
+    fn reads_legacy_response_message_history_without_phase() {
+        let dir = tempdir().unwrap();
+        let cwd = workspace_path(dir.path(), "legacy-response-history");
+        let sessions_dir = dir.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            sessions_dir.join("rollout-1.jsonl"),
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-03-13T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"legacy-response-thread\",\"timestamp\":\"2026-03-13T09:00:00Z\",\"cwd\":\"{}\",\"source\":\"vscode\"}}}}\n",
+                    "{{\"timestamp\":\"2026-03-13T09:00:01Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"reasoning\",\"summary\":[{{\"type\":\"summary_text\",\"text\":\"thinking\"}}],\"content\":null}}}}\n",
+                    "{{\"timestamp\":\"2026-03-13T09:00:02Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"question\"}}]}}}}\n",
+                    "{{\"timestamp\":\"2026-03-13T09:00:03Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"answer\"}}]}}}}\n"
+                ),
+                escaped_json_path(&cwd)
+            ),
+        )
+        .unwrap();
+
+        let history = read_thread_history(dir.path(), "legacy-response-thread", 10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].text, "question");
+        assert_eq!(history[1].text, "answer");
     }
 
     #[test]

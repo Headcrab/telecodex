@@ -58,7 +58,7 @@ No webhook infrastructure. No browser dependency. No cloud relay between Telegra
 - Polls Telegram Bot API via `getUpdates`.
 - Maintains one logical session per Telegram chat/topic pair.
 - Queues turns per session and streams progress by editing Telegram messages in place.
-- Supports `/new`, `/environments`, `/sessions`, `/use`, `/clear`, `/stop`, and per-session runtime settings.
+- Supports `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, and per-session runtime settings.
 - Can bind a Telegram topic to an existing Codex thread by thread id or `latest`.
 - In the primary forum dashboard, environments are listed for import and topics are created on button click by default.
 
@@ -91,11 +91,12 @@ No webhook infrastructure. No browser dependency. No cloud relay between Telegra
 - Unauthorized access attempts are ignored and written to `audit_log`.
 - Supports Codex runtime defaults for sandbox, approval policy, search mode, and writable directories.
 - Supports headless Codex device login from Telegram via `/login` and `/logout`.
-- If Codex is not logged in, Telecodex does not start turns or forward `/status`; it asks the user to authenticate first.
+- If Codex is not logged in, Telecodex does not start turns or forward Codex-native slash commands; it asks the user to authenticate first.
 
 ### History and topic sync
 
 - Reads local Codex history and imports existing sessions by `cwd`.
+- Can browse final assistant messages from the selected Codex session with an interactive pager.
 - Can sync forum topics from Codex Desktop and/or CLI history.
 - Can target a dedicated Telegram forum chat for all new topics.
 - Supports stale topic cleanup on a timer.
@@ -138,7 +139,9 @@ High-level flow:
 | `/cd <absolute_path>` | Change the session working directory |
 | `/pwd` | Show the current working directory |
 | `/environments` | Show importable Codex environments in the primary forum dashboard |
-| `/sessions` | Show sessions available in the current chat |
+| `/sessions` | Show topic sessions in dashboard root, or Codex sessions for the current `cwd` inside a work topic |
+| `/history` | Browse final assistant messages from the selected Codex session with an interactive pager |
+| `/status` | Show the current Telegram session, selected Codex session, and runtime settings |
 | `/stop` | Stop the active turn |
 | `/model [model\|default\|-]` | Set or show the current model |
 | `/think [minimal\|low\|medium\|high\|default\|-]` | Set or show reasoning effort |
@@ -157,7 +160,7 @@ High-level flow:
 
 ### Forwarded to Codex as-is
 
-`/help`, `/status`, `/doctor`, `/prompts`, `/memory`, `/mentions`, `/init`, `/bug`, `/config`, `/compact`, `/agents`, `/diff`
+`/help`, `/doctor`, `/prompts`, `/memory`, `/mentions`, `/init`, `/bug`, `/config`, `/compact`, `/agents`, `/diff`
 
 These commands require an active Codex login. If the local Codex CLI is not authenticated yet, Telecodex will remind the user to run `/login` instead of forwarding them.
 
@@ -333,17 +336,19 @@ task run CONFIG=telecodex.toml
 
 - Unauthorized updates are ignored and logged into `audit_log`.
 - Existing Codex history can be auto-attached by `cwd` unless `/clear` was used.
-- `/sessions` shows sessions for the current Telegram chat/topic context.
+- `/sessions` is contextual: in dashboard root it shows Telegram topic sessions, while inside a work topic it shows Codex sessions for the current `cwd`.
+- `/history` browses final assistant messages from the selected Codex session, starts from the newest message, and wraps around at both ends.
 - In the primary forum dashboard, `/environments` shows importable environments and creates topics only when you press the button unless `telegram.auto_create_topics = true`.
 - `/new` now resets the Codex conversation inside the current topic and keeps the current environment/runtime settings.
 - `/topic` is the explicit path for creating a new Telegram topic from the current environment.
 - `/think` and `/prompt` persist for the current session and affect future turns.
 - During active work the bot sends Telegram chat actions such as typing/upload indicators.
-- In forum dashboard root, use `/topic` or `/environments`; `/new` is meant for an actual work topic.
+- In forum dashboard root, use `/environments` or `/sessions`; `/status`, `/history`, `/new`, and normal prompts are meant for an actual work topic.
 - `/login` starts Codex device authentication in headless mode and sends a clickable auth link plus the one-time code inline in the message.
 - If the device-code endpoint returns `429 Too Many Requests`, the bot reports that in chat and applies a short local backoff before the next `/login` attempt.
 - After `/logout`, the bot stays responsive and keeps suggesting `/login` instead of going silent.
-- If Codex is not logged in, Telecodex does not run turns and does not forward `/status`; it asks the user to authenticate first.
+- `/status` is handled by Telecodex itself and shows the current Telegram session, selected Codex session, and runtime settings.
+- If Codex is not logged in, Telecodex does not run turns and does not forward Codex-native slash commands; it asks the user to authenticate first.
 - If a live prompt clearly asks for fresh information like "today", "latest", or "news", Telecodex can automatically switch that turn to live search.
 
 ## 📄 License
