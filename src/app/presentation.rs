@@ -1,6 +1,6 @@
 use super::support::is_message_thread_not_found;
 use super::*;
-use crate::codex::CodexApprovalRequest;
+use crate::{codex::CodexApprovalRequest, codex_history::read_thread_runtime};
 use html_escape::encode_safe;
 use uuid::Uuid;
 
@@ -502,7 +502,7 @@ pub(super) fn codex_sessions_keyboard(
 ) -> Option<InlineKeyboardMarkup> {
     let mut inline_keyboard = sessions
         .iter()
-        .take(12)
+        .take(50)
         .map(|summary| {
             let current = session.codex_thread_id.as_deref() == Some(summary.id.as_str());
             let text = if current {
@@ -542,7 +542,7 @@ pub(super) fn chat_sessions_keyboard(
     for session in sessions
         .iter()
         .filter(|session| session.key.thread_id > 0)
-        .take(24)
+        .take(50)
     {
         let label = session_title_label(session, chat);
         let current = current_session.key == session.key
@@ -769,14 +769,43 @@ pub(super) fn format_session_status(
                 "unbound"
             })
         });
-    let state = if session.busy { "busy" } else { "idle" };
     let codex_thread = session
         .codex_thread_id
         .as_deref()
         .map(short_codex_thread_id)
         .unwrap_or_else(|| "new".to_string());
-    let model = session.model.as_deref().unwrap_or("default");
-    let reasoning = session.reasoning_effort.as_deref().unwrap_or("default");
+    let runtime = session.codex_thread_id.as_deref().and_then(|thread_id| {
+        read_thread_runtime(&default_codex_home(), thread_id)
+            .ok()
+            .flatten()
+    });
+    let state = if session.busy {
+        "busy"
+    } else if let Some(activity_state) = runtime.as_ref().and_then(|value| value.activity_state) {
+        activity_state.status_label()
+    } else if session.codex_thread_id.is_some() {
+        "telecodex-idle; external-live-state-unknown"
+    } else {
+        "idle"
+    };
+    let model = runtime
+        .as_ref()
+        .and_then(|value| value.model.as_deref())
+        .or(session.model.as_deref())
+        .unwrap_or("default");
+    let reasoning = runtime
+        .as_ref()
+        .and_then(|value| value.reasoning_effort.as_deref())
+        .or(session.reasoning_effort.as_deref())
+        .unwrap_or("default");
+    let approval = runtime
+        .as_ref()
+        .and_then(|value| value.approval_policy.as_deref())
+        .unwrap_or(&session.approval_policy);
+    let sandbox = runtime
+        .as_ref()
+        .and_then(|value| value.sandbox_mode.as_deref())
+        .unwrap_or(&session.sandbox_mode);
     let prompt = if session
         .session_prompt
         .as_deref()
@@ -793,8 +822,8 @@ pub(super) fn format_session_status(
         "**Current Telegram session:** {telegram_title}\n- codex session title: {codex_title}\n- state: `{state}`\n- cwd: `{}`\n- codex thread: `{}`\n- model: `{model}`\n- reasoning: `{reasoning}`\n- approval: `{}`\n- sandbox: `{}`\n- search: `{}`\n- prompt: `{prompt}`",
         session.cwd.display(),
         codex_thread,
-        session.approval_policy,
-        session.sandbox_mode,
+        approval,
+        sandbox,
         session.search_mode.as_codex_value(),
     )
 }
