@@ -734,6 +734,10 @@ impl App {
                                 self.shared.store.list_chat_sessions(message.chat.id)?,
                             )
                             .await?;
+                        let sessions = sessions
+                            .into_iter()
+                            .map(|session| self.resolve_session_codex_binding(session))
+                            .collect::<Result<Vec<_>>>()?;
                         let sessions = retain_active_codex_sessions(
                             self.dedupe_forum_environment_sessions(message.chat.id, sessions)
                                 .await?,
@@ -773,9 +777,14 @@ impl App {
                 BridgeCommand::Sessions => {
                     let session = self.ensure_session(session_key, user.tg_user_id)?;
                     if session.key.thread_id == 0 {
-                        let sessions = retain_active_codex_sessions(
-                            self.shared.store.list_chat_sessions(message.chat.id)?,
-                        )?;
+                        let sessions = self
+                            .shared
+                            .store
+                            .list_chat_sessions(message.chat.id)?
+                            .into_iter()
+                            .map(|session| self.resolve_session_codex_binding(session))
+                            .collect::<Result<Vec<_>>>()?;
+                        let sessions = retain_active_codex_sessions(sessions)?;
                         if sessions.is_empty() {
                             self.send_status(
                                 message.chat.id,
