@@ -28,6 +28,34 @@ pub struct CodexEnvironmentSummary {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexThreadRuntimeSummary {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub approval_policy: Option<String>,
+    pub sandbox_mode: Option<String>,
+    pub activity_state: Option<CodexThreadActivityState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexThreadActivityState {
+    Running,
+    Idle,
+    Aborted,
+    Errored,
+}
+
+impl CodexThreadActivityState {
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::Running => "external-running",
+            Self::Idle => "external-idle",
+            Self::Aborted => "external-aborted",
+            Self::Errored => "external-error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexHistorySource {
     Desktop,
@@ -146,13 +174,28 @@ pub fn read_thread_history(
     read_rollout_history(&path, limit)
 }
 
+pub fn read_thread_runtime(
+    codex_home: &Path,
+    thread_id: &str,
+) -> Result<Option<CodexThreadRuntimeSummary>> {
+    let Some(path) = find_rollout_file_for_thread(codex_home, thread_id)? else {
+        return Ok(None);
+    };
+    read_rollout_runtime(&path)
+}
+
+pub fn is_thread_active(codex_home: &Path, thread_id: &str) -> Result<bool> {
+    find_rollout_file_for_thread_in_root(&codex_home.join("sessions"), thread_id)
+        .map(|path| path.is_some())
+}
+
 pub fn list_threads_for_cwd(
     codex_home: &Path,
     cwd: &Path,
     limit: usize,
 ) -> Result<Vec<CodexThreadSummary>> {
     let target_cwd = environment_identity_for_cwd(cwd);
-    let mut summaries = list_all_threads(codex_home)?;
+    let mut summaries = list_active_threads(codex_home)?;
     summaries.retain(|summary| environment_identity_for_cwd(&summary.cwd) == target_cwd);
     if limit > 0 && summaries.len() > limit {
         summaries.truncate(limit);
@@ -184,7 +227,7 @@ where
     F: FnMut(CodexHistorySource) -> bool,
 {
     let mut environments: HashMap<PathBuf, CodexEnvironmentSummary> = HashMap::new();
-    for thread in list_all_threads(codex_home)? {
+    for thread in list_active_threads(codex_home)? {
         if !allow_source(thread.source) {
             continue;
         }
@@ -243,7 +286,6 @@ pub fn environment_selector_key(environment: &CodexEnvironmentSummary) -> String
 }
 
 fn list_all_threads(codex_home: &Path) -> Result<Vec<CodexThreadSummary>> {
-    let titles = read_session_index(&codex_home.join("session_index.jsonl"))?;
     let mut threads = HashMap::new();
     for summary in scan_rollout_sessions(&codex_home.join("archived_sessions"))? {
         threads.insert(summary.id.clone(), summary);
@@ -251,7 +293,21 @@ fn list_all_threads(codex_home: &Path) -> Result<Vec<CodexThreadSummary>> {
     for summary in scan_rollout_sessions(&codex_home.join("sessions"))? {
         threads.insert(summary.id.clone(), summary);
     }
-    let mut summaries = threads.into_values().collect::<Vec<_>>();
+    apply_session_index_and_sort(codex_home, threads.into_values().collect())
+}
+
+fn list_active_threads(codex_home: &Path) -> Result<Vec<CodexThreadSummary>> {
+    apply_session_index_and_sort(
+        codex_home,
+        scan_rollout_sessions(&codex_home.join("sessions"))?,
+    )
+}
+
+fn apply_session_index_and_sort(
+    codex_home: &Path,
+    mut summaries: Vec<CodexThreadSummary>,
+) -> Result<Vec<CodexThreadSummary>> {
+    let titles = read_session_index(&codex_home.join("session_index.jsonl"))?;
     for summary in &mut summaries {
         if let Some(index) = titles.get(&summary.id) {
             if let Some(title) = index.thread_name.as_deref().map(str::trim) {
@@ -504,6 +560,100 @@ fn read_rollout_history(path: &Path, limit: usize) -> Result<Vec<CodexHistoryEnt
         entries = entries.split_off(entries.len() - limit);
     }
     Ok(entries)
+}
+
+fn read_rollout_runtime(path: &Path) -> Result<Option<CodexThreadRuntimeSummary>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut runtime: Option<CodexThreadRuntimeSummary> = None;
+    let mut activity_by_turn: HashMap<String, CodexThreadActivityState> = HashMap::new();
+    let mut latest_turn_id: Option<String> = None;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match value.get("type").and_then(|kind| kind.as_str()) {
+            Some("turn_context") => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                runtime = Some(CodexThreadRuntimeSummary {
+                    model: payload
+                        .get("model")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
+                    reasoning_effort: payload
+                        .pointer("/collaboration_mode/settings/reasoning_effort")
+                        .or_else(|| payload.get("effort"))
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
+                    approval_policy: payload
+                        .get("approval_policy")
+                        .or_else(|| payload.get("approvalPolicy"))
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
+                    sandbox_mode: payload
+                        .get("sandbox_policy")
+                        .or_else(|| payload.get("sandboxPolicy"))
+                        .and_then(sandbox_mode_from_value),
+                    activity_state: None,
+                });
+            }
+            Some("event_msg") => {
+                if let Some((turn_id, state)) = activity_state_from_event_value(&value) {
+                    activity_by_turn.insert(turn_id.clone(), state);
+                    latest_turn_id = Some(turn_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    let activity_state = latest_turn_id
+        .as_ref()
+        .and_then(|turn_id| activity_by_turn.get(turn_id).copied());
+    if let Some(runtime) = runtime.as_mut() {
+        runtime.activity_state = activity_state;
+    } else if activity_state.is_some() {
+        runtime = Some(CodexThreadRuntimeSummary {
+            activity_state,
+            ..CodexThreadRuntimeSummary::default()
+        });
+    }
+    Ok(runtime)
+}
+
+fn activity_state_from_event_value(
+    value: &serde_json::Value,
+) -> Option<(String, CodexThreadActivityState)> {
+    let payload = value.get("payload")?;
+    let turn_id = payload.get("turn_id").and_then(|value| value.as_str())?;
+    let state = match payload.get("type").and_then(|value| value.as_str())? {
+        "task_started" => CodexThreadActivityState::Running,
+        "task_complete" => CodexThreadActivityState::Idle,
+        "turn_aborted" => CodexThreadActivityState::Aborted,
+        "error" => CodexThreadActivityState::Errored,
+        _ => return None,
+    };
+    Some((turn_id.to_string(), state))
+}
+
+fn sandbox_mode_from_value(value: &serde_json::Value) -> Option<String> {
+    let raw = value
+        .get("type")
+        .or_else(|| value.get("mode"))
+        .and_then(|value| value.as_str())?;
+    Some(
+        match raw {
+            "dangerFullAccess" | "danger-full-access" => "danger-full-access",
+            "workspaceWrite" | "workspace-write" => "workspace-write",
+            "readOnly" | "read-only" => "read-only",
+            other => other,
+        }
+        .to_string(),
+    )
 }
 
 fn history_entry_from_event_payload(
@@ -1221,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_threads_from_archived_sessions() {
+    fn list_threads_for_cwd_excludes_archived_sessions() {
         let dir = tempdir().unwrap();
         let cwd = workspace_path(dir.path(), "archive-only");
         let archived_dir = archived_sessions_dir(dir.path());
@@ -1237,8 +1387,8 @@ mod tests {
         .unwrap();
 
         let threads = list_threads_for_cwd(dir.path(), &cwd, 10).unwrap();
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].id, "archived-1");
+        assert!(threads.is_empty());
+        assert!(!is_thread_active(dir.path(), "archived-1").unwrap());
     }
 
     #[test]

@@ -826,10 +826,16 @@ pub(super) fn resolve_session_codex_binding_from_history(
     shared: &Arc<AppShared>,
     session: crate::models::SessionRecord,
 ) -> Result<crate::models::SessionRecord> {
-    if session.codex_thread_id.is_some() || session.force_fresh_thread {
+    if session.force_fresh_thread {
         return Ok(session);
     }
-    let Some(summary) = latest_thread_for_cwd(&default_codex_home(), &session.cwd)? else {
+    let codex_home = default_codex_home();
+    if let Some(thread_id) = session.codex_thread_id.as_deref() {
+        if crate::codex_history::is_thread_active(&codex_home, thread_id)? {
+            return Ok(session);
+        }
+    }
+    let Some(summary) = latest_thread_for_cwd(&codex_home, &session.cwd)? else {
         return Ok(session);
     };
     shared

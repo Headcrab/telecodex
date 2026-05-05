@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::SearchMode;
 use std::path::PathBuf;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use tempfile::NamedTempFile;
 
 fn sample_workspace() -> PathBuf {
@@ -44,6 +45,71 @@ fn sample_turn_request(session_key: SessionKey) -> TurnRequest {
         attachments: vec![],
         review_mode: None,
         override_search_mode: None,
+    }
+}
+
+fn codex_home_test_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+struct CodexHomeGuard(Option<std::ffi::OsString>);
+
+impl CodexHomeGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", path);
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for CodexHomeGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => unsafe {
+                std::env::set_var("CODEX_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CODEX_HOME");
+            },
+        }
+    }
+}
+
+fn sample_config(db_path: PathBuf, default_cwd: PathBuf) -> Config {
+    Config {
+        telegram: crate::config::TelegramConfig {
+            bot_token: Some("test-token".to_string()),
+            bot_token_env: None,
+            api_base: "https://api.telegram.org".to_string(),
+            use_message_drafts: false,
+            primary_forum_chat_id: None,
+            auto_create_topics: false,
+            forum_sync_topics_per_poll: 2,
+            stale_topic_days: None,
+            stale_topic_action: crate::config::StaleTopicAction::None,
+        },
+        codex: crate::config::CodexConfig {
+            binary: PathBuf::from("codex"),
+            default_cwd: default_cwd.clone(),
+            default_model: Some("gpt-5.4".to_string()),
+            default_reasoning_effort: Some("medium".to_string()),
+            default_sandbox: "workspace-write".to_string(),
+            default_approval: "never".to_string(),
+            default_search_mode: SearchMode::Disabled,
+            default_add_dirs: vec![],
+            seed_workspaces: vec![],
+            import_desktop_history: true,
+            import_cli_history: true,
+        },
+        db_path,
+        startup_admin_ids: vec![],
+        poll_timeout_seconds: 30,
+        edit_debounce_ms: 250,
+        max_text_chunk: 3500,
+        tmp_dir: None,
     }
 }
 
@@ -1275,4 +1341,138 @@ async fn upload_failure_marks_turn_failed_and_cleanup_still_runs() {
             .iter()
             .any(|message| message.contains("upload failed"))
     );
+}
+
+#[test]
+fn rebinds_stale_session_to_latest_active_thread_for_same_cwd() {
+    let _lock = codex_home_test_lock().lock().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let workspace = codex_home.path().join("workspace");
+    std::fs::create_dir_all(codex_home.path().join("sessions")).unwrap();
+    std::fs::create_dir_all(codex_home.path().join("archived_sessions")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        codex_home
+            .path()
+            .join("archived_sessions")
+            .join("rollout-archive.jsonl"),
+        format!(
+            "{{\"timestamp\":\"2026-03-13T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"archived-thread\",\"timestamp\":\"2026-03-13T08:00:00Z\",\"cwd\":\"{}\",\"source\":\"exec\"}}}}\n",
+            workspace.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        codex_home
+            .path()
+            .join("sessions")
+            .join("rollout-active.jsonl"),
+        format!(
+            "{{\"timestamp\":\"2026-03-13T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"active-thread\",\"timestamp\":\"2026-03-13T09:00:00Z\",\"cwd\":\"{}\",\"source\":\"exec\"}}}}\n",
+            workspace.display()
+        ),
+    )
+    .unwrap();
+
+    let _codex_home_guard = CodexHomeGuard::set(codex_home.path());
+
+    let db = NamedTempFile::new().unwrap();
+    let config = sample_config(db.path().to_path_buf(), workspace.clone());
+    let store = Store::open(db.path(), &[100], &sample_defaults()).unwrap();
+    let shared = Arc::new(AppShared {
+        config,
+        store,
+        telegram: TelegramClient::new(
+            "test-token".to_string(),
+            "https://api.telegram.org".to_string(),
+        ),
+        codex: CodexRunner::new(PathBuf::from("codex")),
+        bot_username: None,
+        service_user_id: 0,
+        handy_model_dir: None,
+        session_defaults: sample_defaults(),
+        limits_cache: Mutex::new(None),
+        history_page_cache: Mutex::new(HistoryPageCache::default()),
+        pending_approvals: Mutex::new(HashMap::new()),
+        pending_codex_login: Mutex::new(None),
+        codex_login_backoff_until: Mutex::new(None),
+    });
+    let session = shared
+        .store
+        .ensure_session(SessionKey::new(1, Some(52)), 100, &sample_defaults())
+        .unwrap();
+    shared
+        .store
+        .set_session_cwd(session.key, &workspace)
+        .unwrap();
+    shared
+        .store
+        .set_session_codex_thread(session.key, "archived-thread")
+        .unwrap();
+    let session = shared.store.get_session(session.key).unwrap().unwrap();
+
+    let rebound = resolve_session_codex_binding_from_history(&shared, session).unwrap();
+
+    assert_eq!(rebound.codex_thread_id.as_deref(), Some("active-thread"));
+}
+
+#[test]
+fn keeps_truly_archived_session_unbound_when_no_active_replacement_exists() {
+    let _lock = codex_home_test_lock().lock().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let workspace = codex_home.path().join("workspace");
+    std::fs::create_dir_all(codex_home.path().join("archived_sessions")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        codex_home
+            .path()
+            .join("archived_sessions")
+            .join("rollout-archive.jsonl"),
+        format!(
+            "{{\"timestamp\":\"2026-03-13T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"archived-thread\",\"timestamp\":\"2026-03-13T08:00:00Z\",\"cwd\":\"{}\",\"source\":\"exec\"}}}}\n",
+            workspace.display()
+        ),
+    )
+    .unwrap();
+
+    let _codex_home_guard = CodexHomeGuard::set(codex_home.path());
+
+    let db = NamedTempFile::new().unwrap();
+    let config = sample_config(db.path().to_path_buf(), workspace.clone());
+    let store = Store::open(db.path(), &[100], &sample_defaults()).unwrap();
+    let shared = Arc::new(AppShared {
+        config,
+        store,
+        telegram: TelegramClient::new(
+            "test-token".to_string(),
+            "https://api.telegram.org".to_string(),
+        ),
+        codex: CodexRunner::new(PathBuf::from("codex")),
+        bot_username: None,
+        service_user_id: 0,
+        handy_model_dir: None,
+        session_defaults: sample_defaults(),
+        limits_cache: Mutex::new(None),
+        history_page_cache: Mutex::new(HistoryPageCache::default()),
+        pending_approvals: Mutex::new(HashMap::new()),
+        pending_codex_login: Mutex::new(None),
+        codex_login_backoff_until: Mutex::new(None),
+    });
+    let session = shared
+        .store
+        .ensure_session(SessionKey::new(1, Some(52)), 100, &sample_defaults())
+        .unwrap();
+    shared
+        .store
+        .set_session_cwd(session.key, &workspace)
+        .unwrap();
+    shared
+        .store
+        .set_session_codex_thread(session.key, "archived-thread")
+        .unwrap();
+    let session = shared.store.get_session(session.key).unwrap().unwrap();
+
+    let rebound = resolve_session_codex_binding_from_history(&shared, session).unwrap();
+
+    assert_eq!(rebound.codex_thread_id.as_deref(), Some("archived-thread"));
 }

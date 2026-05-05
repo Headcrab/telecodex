@@ -751,23 +751,10 @@ fn build_sandbox_policy(session: &SessionRecord) -> Value {
     match session.sandbox_mode.as_str() {
         "danger-full-access" => json!({"type":"dangerFullAccess"}),
         "workspace-write" => {
-            let mut policy = json!({"type":"workspaceWrite","writableRoots":collect_session_roots(session),"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false});
-            if !cfg!(windows) {
-                policy["readOnlyAccess"] = build_read_only_access(session);
-            }
-            policy
+            json!({"type":"workspaceWrite","writableRoots":collect_session_roots(session),"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false})
         }
-        _ => {
-            let mut policy = json!({"type":"readOnly","networkAccess":true});
-            if !cfg!(windows) {
-                policy["access"] = build_read_only_access(session);
-            }
-            policy
-        }
+        _ => json!({"type":"readOnly","networkAccess":true}),
     }
-}
-fn build_read_only_access(session: &SessionRecord) -> Value {
-    json!({"type":"restricted","includePlatformDefaults":true,"readableRoots":collect_session_roots(session)})
 }
 fn collect_session_roots(session: &SessionRecord) -> Vec<String> {
     let mut roots = BTreeSet::new();
@@ -1507,37 +1494,17 @@ mod tests {
     }
 
     #[test]
-    fn windows_read_only_omits_restricted_access() {
+    fn read_only_omits_legacy_restricted_access() {
         let session = session_with_sandbox("read-only");
         let policy = build_sandbox_policy(&session);
-        if cfg!(windows) {
-            assert!(policy.get("access").is_none());
-        } else {
-            assert_eq!(
-                policy
-                    .get("access")
-                    .and_then(|value| value.get("type"))
-                    .and_then(Value::as_str),
-                Some("restricted")
-            );
-        }
+        assert!(policy.get("access").is_none());
     }
 
     #[test]
-    fn windows_workspace_write_omits_restricted_read_only_access() {
+    fn workspace_write_omits_legacy_restricted_read_only_access() {
         let session = session_with_sandbox("workspace-write");
         let policy = build_sandbox_policy(&session);
-        if cfg!(windows) {
-            assert!(policy.get("readOnlyAccess").is_none());
-        } else {
-            assert_eq!(
-                policy
-                    .get("readOnlyAccess")
-                    .and_then(|value| value.get("type"))
-                    .and_then(Value::as_str),
-                Some("restricted")
-            );
-        }
+        assert!(policy.get("readOnlyAccess").is_none());
     }
 
     #[test]

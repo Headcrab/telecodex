@@ -26,6 +26,25 @@ pub(super) fn prefer_primary_environment_session(
     normalize_path(session.cwd.clone()) == normalize_path(environment_key.to_path_buf())
 }
 
+pub(super) fn retain_active_codex_sessions(
+    sessions: Vec<crate::models::SessionRecord>,
+) -> Result<Vec<crate::models::SessionRecord>> {
+    let codex_home = default_codex_home();
+    sessions
+        .into_iter()
+        .filter_map(|session| {
+            let Some(thread_id) = session.codex_thread_id.as_deref() else {
+                return Some(Ok(session));
+            };
+            match crate::codex_history::is_thread_active(&codex_home, thread_id) {
+                Ok(true) => Some(Ok(session)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
 pub(super) fn command_uses_session_context(parsed: &ParsedInput) -> bool {
     match parsed {
         ParsedInput::Forward(_) => true,
