@@ -463,12 +463,17 @@ fn read_rollout_session_meta(path: &Path) -> Result<Option<CodexThreadSummary>> 
                     return Ok(None);
                 };
                 if let Some(cwd) = meta.cwd {
-                    summary_meta = Some((
-                        meta.id,
-                        cwd,
-                        meta.timestamp,
-                        classify_history_source(meta.source.as_deref(), meta.originator.as_deref()),
-                    ));
+                    if summary_meta.is_none() {
+                        summary_meta = Some((
+                            meta.id,
+                            cwd,
+                            meta.timestamp,
+                            classify_history_source(
+                                meta.source.as_deref(),
+                                meta.originator.as_deref(),
+                            ),
+                        ));
+                    }
                     if let Some((id, cwd, timestamp, source)) = summary_meta.as_ref() {
                         if preview_title.is_some() {
                             return Ok(Some(build_thread_summary(
@@ -950,14 +955,10 @@ fn git_environment_root(cwd: &Path) -> Option<PathBuf> {
     if git_path.is_dir() {
         return Some(normalize_path(cwd.to_path_buf()));
     }
-    let raw = fs::read_to_string(&git_path).ok()?;
-    let gitdir = raw.trim().strip_prefix("gitdir:")?.trim();
-    let gitdir_path = git_path.parent()?.join(gitdir);
-    let gitdir_path = normalize_path(fs::canonicalize(gitdir_path).ok()?);
-    let commondir = fs::read_to_string(gitdir_path.join("commondir")).ok()?;
-    let common_dir = gitdir_path.join(commondir.trim());
-    let common_dir = normalize_path(fs::canonicalize(common_dir).ok()?);
-    Some(normalize_path(common_dir.parent()?.to_path_buf()))
+    if git_path.is_file() {
+        return Some(normalize_path(cwd.to_path_buf()));
+    }
+    None
 }
 
 fn normalize_path(path: PathBuf) -> PathBuf {
@@ -1029,6 +1030,39 @@ mod tests {
         assert_eq!(threads[0].id, "abc123");
         assert_eq!(threads[0].title, "From index");
         assert_eq!(threads[0].source, CodexHistorySource::Cli);
+    }
+
+    #[test]
+    fn keeps_first_session_meta_for_forked_rollout() {
+        let dir = tempdir().unwrap();
+        let current_cwd = workspace_path(dir.path(), "current");
+        let parent_cwd = workspace_path(dir.path(), "parent");
+        let sessions_dir = dir
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("03")
+            .join("13");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&current_cwd).unwrap();
+        fs::create_dir_all(&parent_cwd).unwrap();
+        fs::write(
+            sessions_dir.join("rollout-current.jsonl"),
+            format!(
+                "{{\"timestamp\":\"2026-03-13T11:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"current\",\"timestamp\":\"2026-03-13T11:00:00Z\",\"cwd\":\"{}\",\"source\":\"cli\"}}}}\n\
+                 {{\"timestamp\":\"2026-03-13T11:00:01Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"parent\",\"timestamp\":\"2026-03-13T10:00:00Z\",\"cwd\":\"{}\",\"source\":\"cli\"}}}}\n",
+                escaped_json_path(&current_cwd),
+                escaped_json_path(&parent_cwd)
+            ),
+        )
+        .unwrap();
+
+        let current_threads = list_threads_for_cwd(dir.path(), &current_cwd, 10).unwrap();
+        let parent_threads = list_threads_for_cwd(dir.path(), &parent_cwd, 10).unwrap();
+
+        assert_eq!(current_threads.len(), 1);
+        assert_eq!(current_threads[0].id, "current");
+        assert!(parent_threads.is_empty());
     }
 
     #[test]
@@ -1206,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn collapses_git_worktrees_into_one_environment() {
+    fn keeps_git_worktrees_as_separate_environments() {
         let dir = tempdir().unwrap();
         let main_repo = dir.path().join("repos").join("robin2");
         let worktree = dir
@@ -1236,7 +1270,7 @@ mod tests {
         );
         assert_eq!(
             environment_identity_for_cwd(&worktree),
-            normalize_path(main_repo)
+            normalize_path(worktree)
         );
     }
 

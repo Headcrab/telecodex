@@ -130,24 +130,25 @@ pub(super) async fn process_turn(
                 shared.store.set_session_busy(session.key, false)?;
                 let sink_for_success = sink.clone();
                 let sink_for_failure = sink.clone();
-                finalize_foreground_turn(
-                        ForegroundTurnSuccess {
-                            store: &shared.store,
-                            session: &session,
-                            turn_id,
-                            review_mode: queued.request.review_mode.is_some(),
-                            summary: &summary,
-                        },
-                        || async {
-                            send_generated_artifacts(&shared, &session, &turn_workspace.out_dir)
-                                .await
-                        },
-                        || async move { sink_for_success.lock().await.finish(None).await },
-                        |message| async move {
-                            sink_for_failure.lock().await.finish(Some(message)).await
-                        },
-                    )
-                    .await
+                let result = finalize_foreground_turn(
+                    ForegroundTurnSuccess {
+                        store: &shared.store,
+                        session: &session,
+                        turn_id,
+                        review_mode: queued.request.review_mode.is_some(),
+                        summary: &summary,
+                    },
+                    || async {
+                        send_generated_artifacts(&shared, &session, &turn_workspace.out_dir).await
+                    },
+                    || async move { sink_for_success.lock().await.finish(None).await },
+                    |message| async move { sink_for_failure.lock().await.finish(Some(message)).await },
+                )
+                .await;
+                if result.is_ok() {
+                    notify_turn_completion(&shared, session.key).await;
+                }
+                result
             }
             Err(error) => {
                 let status = if error.to_string().contains("cancelled") {
@@ -303,6 +304,32 @@ async fn finish_failed_turn(
     }
     sink.lock().await.finish(Some(message)).await?;
     Ok(())
+}
+
+async fn notify_turn_completion(shared: &Arc<AppShared>, session_key: SessionKey) {
+    let Some(text) =
+        turn_completion_notification_text(&shared.config.telegram.completion_notify_usernames)
+    else {
+        return;
+    };
+    let result = shared
+        .telegram
+        .send_message(SendMessage::html(
+            session_key.chat_id,
+            Some(session_key.thread_id).filter(|value| *value != 0),
+            html_escape::encode_safe(&text).to_string(),
+        ))
+        .await;
+    if let Err(error) = result {
+        tracing::warn!("failed to send turn completion notification: {error:#}");
+    }
+}
+
+pub(super) fn turn_completion_notification_text(usernames: &[String]) -> Option<String> {
+    if usernames.is_empty() {
+        return None;
+    }
+    Some(format!("Готово, {} fyi ✅", usernames.join(" ")))
 }
 
 pub(super) fn should_reset_session_after_error(error: &anyhow::Error) -> bool {

@@ -381,6 +381,7 @@ impl TelegramClient {
             .ok_or_else(|| anyhow::anyhow!("telegram {method} returned ok without result"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn post_multipart_message(
         &self,
         method: &str,
@@ -746,7 +747,7 @@ pub fn preferred_image_file_id(message: &Message) -> Option<&str> {
     message
         .photo
         .iter()
-        .max_by_key(|size| size.file_size.unwrap_or((size.width * size.height) as i64))
+        .max_by_key(|size| size.file_size.unwrap_or(size.width * size.height))
         .map(|photo| photo.file_id.as_str())
 }
 
