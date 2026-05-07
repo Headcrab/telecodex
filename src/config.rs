@@ -39,6 +39,8 @@ pub struct TelegramConfig {
     pub stale_topic_days: Option<i64>,
     #[serde(default)]
     pub stale_topic_action: StaleTopicAction,
+    #[serde(default)]
+    pub completion_notify_usernames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -191,6 +193,17 @@ impl Config {
         if self.telegram.forum_sync_topics_per_poll == 0 {
             bail!("telegram.forum_sync_topics_per_poll must be >= 1");
         }
+        let mut completion_notify_usernames = Vec::new();
+        for username in &self.telegram.completion_notify_usernames {
+            let username = normalize_completion_notify_username(username)?;
+            if !completion_notify_usernames
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&username))
+            {
+                completion_notify_usernames.push(username);
+            }
+        }
+        self.telegram.completion_notify_usernames = completion_notify_usernames;
 
         if self.codex.binary.as_os_str().is_empty() {
             bail!("codex.binary must not be empty");
@@ -258,6 +271,29 @@ fn default_search_mode() -> SearchMode {
     SearchMode::Disabled
 }
 
+fn normalize_completion_notify_username(input: &str) -> Result<String> {
+    let username = input.trim().trim_start_matches('@');
+    if username.is_empty() {
+        bail!("telegram.completion_notify_usernames entries must not be empty");
+    }
+    if !(5..=32).contains(&username.len()) {
+        bail!(
+            "telegram.completion_notify_usernames entry `{}` must be 5..=32 characters",
+            input
+        );
+    }
+    if !username
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!(
+            "telegram.completion_notify_usernames entry `{}` must contain only letters, digits, or underscores",
+            input
+        );
+    }
+    Ok(format!("@{username}"))
+}
+
 fn resolve_binary_path(input: &Path) -> Result<PathBuf> {
     if input.is_absolute() {
         if input.is_file() {
@@ -296,18 +332,22 @@ fn resolve_binary_path(input: &Path) -> Result<PathBuf> {
 }
 
 fn command_candidates(input: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
     #[cfg(windows)]
     {
+        let mut candidates = Vec::new();
         let stem = input.as_os_str().to_string_lossy();
         if !stem.contains('.') {
             for ext in [".cmd", ".exe", ".bat"] {
                 candidates.push(PathBuf::from(format!("{stem}{ext}")));
             }
         }
+        candidates.push(input.to_path_buf());
+        candidates
     }
-    candidates.push(input.to_path_buf());
-    candidates
+    #[cfg(not(windows))]
+    {
+        vec![input.to_path_buf()]
+    }
 }
 
 fn normalize_path(path: PathBuf) -> PathBuf {
@@ -362,5 +402,32 @@ fn find_vendored_codex_exe(wrapper_path: &Path) -> Option<PathBuf> {
         Some(normalize_path(candidate))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_completion_notify_usernames() {
+        assert_eq!(
+            normalize_completion_notify_username(" sample_user ")
+                .unwrap()
+                .as_str(),
+            "@sample_user"
+        );
+        assert_eq!(
+            normalize_completion_notify_username("@sample_user")
+                .unwrap()
+                .as_str(),
+            "@sample_user"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_completion_notify_usernames() {
+        assert!(normalize_completion_notify_username("@bad-name").is_err());
+        assert!(normalize_completion_notify_username("@abc").is_err());
     }
 }

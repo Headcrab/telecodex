@@ -398,8 +398,18 @@ where
             let Some(message)=next_message? else {break;};
             match message{
               RpcMessage::Response{id,result,error}=>{
-                if id==turn_request_id{if let Some(error)=error{turn_error=Some(format_rpc_error(&error)); break;} if let Some(turn_id)=result.as_ref().and_then(|v|v.get("turn")).and_then(|t|t.get("id")).and_then(Value::as_str){active_turn_id=Some(turn_id.to_string());}}
-                else if error.is_some() && interrupt_sent {turn_error=Some(format!("turn/interrupt failed: {}",format_rpc_error(error.as_ref().expect("interrupt error missing")))); break;}
+                if id==turn_request_id{
+                    if let Some(error)=error{
+                        turn_error=Some(format_rpc_error(&error));
+                        break;
+                    }
+                    if let Some(turn_id)=result.as_ref().and_then(|v|v.get("turn")).and_then(|t|t.get("id")).and_then(Value::as_str){
+                        active_turn_id=Some(turn_id.to_string());
+                    }
+                } else if error.is_some() && interrupt_sent {
+                    turn_error=Some(format!("turn/interrupt failed: {}",format_rpc_error(error.as_ref().expect("interrupt error missing"))));
+                    break;
+                }
               }
               RpcMessage::Notification{method,params}=>{handle_notification(&method,&params,&mut summary,&mut active_turn_id,&mut turn_error,&mut turn_completed,&mut assistant_message_completed,on_event).await?;}
                 RpcMessage::ServerRequest{id,method,params}=>{handle_server_request(&mut process,id,&method,&params,on_event).await?;}
@@ -417,6 +427,7 @@ where
     Ok(summary)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_notification<F, Fut>(
     method: &str,
     params: &Value,
@@ -993,7 +1004,7 @@ fn build_file_change_approval_request(params: &Value) -> CodexApprovalRequest {
     }
 }
 
-fn approval_request_payload<'a>(params: &'a Value) -> &'a Value {
+fn approval_request_payload(params: &Value) -> &Value {
     params
         .get("request")
         .or_else(|| params.get("approvalRequest"))

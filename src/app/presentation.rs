@@ -421,7 +421,27 @@ fn format_history_preview_plain_block(text: &str) -> String {
 }
 
 fn format_history_preview_html_block(text: &str) -> String {
-    render_markdown_to_html(text)
+    render_markdown_to_html(&normalize_history_quote_lines(text))
+}
+
+fn normalize_history_quote_lines(text: &str) -> String {
+    if text.lines().any(|line| line.trim_start().starts_with('│')) {
+        return text
+            .lines()
+            .map(normalize_history_quote_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    text.to_string()
+}
+
+fn normalize_history_quote_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('│') {
+        rest.trim_start().to_string()
+    } else {
+        line.to_string()
+    }
 }
 
 fn sanitize_history_preview_line(line: &str) -> String {
@@ -444,6 +464,12 @@ fn merge_history_preview_entries(entries: &[CodexHistoryEntry]) -> Vec<CodexHist
         if text.is_empty() {
             continue;
         }
+        if merged
+            .last()
+            .is_some_and(|last| last.role == entry.role && last.text.trim() == text)
+        {
+            continue;
+        }
         if let Some(last) = merged.last_mut() {
             if last.role == entry.role {
                 if !last.text.is_empty() {
@@ -464,8 +490,8 @@ fn merge_history_preview_entries(entries: &[CodexHistoryEntry]) -> Vec<CodexHist
 }
 
 fn truncate_history_preview(text: &str) -> String {
-    const MAX_CHARS: usize = 1200;
-    const MAX_LINES: usize = 16;
+    const MAX_CHARS: usize = 650;
+    const MAX_LINES: usize = 10;
 
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines = normalized

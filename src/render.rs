@@ -112,16 +112,16 @@ fn render_inline(line: &str) -> String {
     let mut code = false;
 
     while idx < chars.len() {
-        if idx + 1 < chars.len() && chars[idx] == '*' && chars[idx + 1] == '*' {
-            output.push_str(if bold { "</b>" } else { "<b>" });
-            bold = !bold;
-            idx += 2;
-            continue;
-        }
         if chars[idx] == '`' {
             output.push_str(if code { "</code>" } else { "<code>" });
             code = !code;
             idx += 1;
+            continue;
+        }
+        if !code && idx + 1 < chars.len() && chars[idx] == '*' && chars[idx + 1] == '*' {
+            output.push_str(if bold { "</b>" } else { "<b>" });
+            bold = !bold;
+            idx += 2;
             continue;
         }
         if !code && (chars[idx] == '*' || chars[idx] == '_') {
@@ -168,14 +168,26 @@ fn try_render_link(slice: &[char]) -> Option<(String, usize)> {
     let url_stop = url_start + url_end;
     let url: String = slice[url_start..url_stop].iter().collect();
     let consumed = url_stop + 1;
-    Some((
-        format!(
-            "<a href=\"{}\">{}</a>",
-            encode_safe(&url),
-            encode_safe(&label)
-        ),
-        consumed,
-    ))
+    if is_telegram_link_url(&url) {
+        Some((
+            format!(
+                "<a href=\"{}\">{}</a>",
+                encode_safe(&url),
+                encode_safe(&label)
+            ),
+            consumed,
+        ))
+    } else {
+        Some((
+            format!("{} ({})", encode_safe(&label), encode_safe(&url)),
+            consumed,
+        ))
+    }
+}
+
+fn is_telegram_link_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("tg://")
 }
 
 #[cfg(test)]
@@ -186,6 +198,29 @@ mod tests {
     fn renders_code_blocks() {
         let rendered = render_markdown_to_html("hello\n```rs\nfn main() {}\n```");
         assert!(rendered.contains("<pre><code class=\"language-rs\">"));
+    }
+
+    #[test]
+    fn leaves_local_markdown_links_as_text() {
+        let rendered = render_markdown_to_html("[repo](/home/s/projects/repo)");
+        assert_eq!(rendered, "repo (&#x2F;home&#x2F;s&#x2F;projects&#x2F;repo)");
+    }
+
+    #[test]
+    fn renders_http_markdown_links_as_anchors() {
+        let rendered = render_markdown_to_html("[site](https://example.com)");
+        assert_eq!(
+            rendered,
+            "<a href=\"https:&#x2F;&#x2F;example.com\">site</a>"
+        );
+    }
+
+    #[test]
+    fn does_not_render_markdown_inside_inline_code() {
+        let rendered = render_markdown_to_html("`services/internal/project-catalog/**`");
+        assert!(rendered.contains("<code>"));
+        assert!(rendered.contains("</code>"));
+        assert!(!rendered.contains("<b>"));
     }
 
     #[test]

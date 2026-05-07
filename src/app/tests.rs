@@ -90,6 +90,7 @@ fn sample_config(db_path: PathBuf, default_cwd: PathBuf) -> Config {
             forum_sync_topics_per_poll: 2,
             stale_topic_days: None,
             stale_topic_action: crate::config::StaleTopicAction::None,
+            completion_notify_usernames: vec![],
         },
         codex: crate::config::CodexConfig {
             binary: PathBuf::from("codex"),
@@ -118,6 +119,20 @@ fn detects_stale_codex_thread_errors() {
     let error = anyhow::anyhow!("no rollout found for thread id 019abc | code -32600");
 
     assert!(should_reset_session_after_error(&error));
+}
+
+#[test]
+fn formats_turn_completion_notification() {
+    assert_eq!(turn_completion_notification_text(&[]), None);
+    assert_eq!(
+        turn_completion_notification_text(&["@sama".to_string()]).as_deref(),
+        Some("Готово, @sama fyi ✅")
+    );
+    assert_eq!(
+        turn_completion_notification_text(&["@sama".to_string(), "@reviewer".to_string()])
+            .as_deref(),
+        Some("Готово, @sama @reviewer fyi ✅")
+    );
 }
 
 #[test]
@@ -932,6 +947,24 @@ fn merges_adjacent_history_entries_with_same_role() {
 }
 
 #[test]
+fn deduplicates_adjacent_identical_history_entries() {
+    let preview = format_codex_history_preview_plain(&[
+        CodexHistoryEntry {
+            role: "assistant".to_string(),
+            text: "same answer".to_string(),
+            timestamp: "2026-03-13T09:00:01Z".to_string(),
+        },
+        CodexHistoryEntry {
+            role: "assistant".to_string(),
+            text: "same answer".to_string(),
+            timestamp: "2026-03-13T09:00:02Z".to_string(),
+        },
+    ]);
+
+    assert_eq!(preview.matches("same answer").count(), 1);
+}
+
+#[test]
 fn formats_recent_codex_history_preview_as_html_blockquotes() {
     let preview = format_codex_history_preview_html(&[
         CodexHistoryEntry {
@@ -962,6 +995,19 @@ fn preserves_markdown_inside_history_html_blockquotes() {
     assert!(preview.contains(
             "<blockquote>Then yes, <b>counting</b> is already in progress and there is <code>code</code>.</blockquote>"
         ));
+}
+
+#[test]
+fn normalizes_history_lines_that_already_use_quote_prefixes() {
+    let preview = format_codex_history_preview_html(&[CodexHistoryEntry {
+        role: "assistant".to_string(),
+        text: "│ **Codex**\n│ [repo](/home/s/projects/repo)".to_string(),
+        timestamp: "2026-03-13T09:00:03Z".to_string(),
+    }]);
+
+    assert!(preview.contains(
+        "<blockquote><b>Codex</b>\nrepo (&#x2F;home&#x2F;s&#x2F;projects&#x2F;repo)</blockquote>"
+    ));
 }
 
 #[test]
