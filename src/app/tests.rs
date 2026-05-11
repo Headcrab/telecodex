@@ -1453,6 +1453,7 @@ fn rebinds_stale_session_to_latest_active_thread_for_same_cwd() {
         pending_approvals: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
+        shutdown: CancellationToken::new(),
     });
     let session = shared
         .store
@@ -1514,6 +1515,7 @@ fn keeps_truly_archived_session_unbound_when_no_active_replacement_exists() {
         pending_approvals: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
+        shutdown: CancellationToken::new(),
     });
     let session = shared
         .store

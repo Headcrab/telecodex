@@ -14,6 +14,8 @@ use crate::{
     models::{ReviewRequest, SessionKey, SessionRecord, TurnRequest, UserRecord, UserRole},
 };
 
+pub const INSTANCE_LOCK_LOST_ERROR: &str = "Telecodex database instance lock was lost";
+
 pub struct Store {
     conn: Mutex<Connection>,
     instance_id: String,
@@ -131,7 +133,7 @@ impl Store {
             params![self.instance_id, now_string()],
         )?;
         if changed == 0 {
-            return Err(anyhow!("Telecodex database instance lock was lost"));
+            return Err(anyhow!(INSTANCE_LOCK_LOST_ERROR));
         }
         Ok(())
     }

@@ -48,7 +48,7 @@ use crate::{
         AttachmentKind, LocalAttachment, SessionKey, TelegramMessageRef, TurnRequest, UserRole,
     },
     render::{render_markdown_to_html, split_text},
-    store::{SessionDefaults, Store},
+    store::{INSTANCE_LOCK_LOST_ERROR, SessionDefaults, Store},
     telegram::{
         ChatAction, EditMessageText, InlineKeyboardButton, InlineKeyboardMarkup, Message,
         SendMessage, TelegramClient, TelegramError, is_foreign_bot_command, normalize_command,
@@ -79,6 +79,7 @@ struct AppShared {
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
     pending_codex_login: Mutex<Option<PendingCodexLogin>>,
     codex_login_backoff_until: Mutex<Option<Instant>>,
+    shutdown: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -220,6 +221,7 @@ impl App {
                 pending_approvals: Mutex::new(HashMap::new()),
                 pending_codex_login: Mutex::new(None),
                 codex_login_backoff_until: Mutex::new(None),
+                shutdown: CancellationToken::new(),
             }),
             workers: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -249,7 +251,7 @@ impl App {
 
         let mut offset = self.shared.store.last_update_id()?.map(|value| value + 1);
         tracing::info!("telecodex started {}", app_version_label());
-        let shutdown = shutdown_signal();
+        let shutdown = shutdown_signal(self.shared.shutdown.clone());
         tokio::pin!(shutdown);
 
         loop {
@@ -304,6 +306,10 @@ impl App {
             .await;
             if let Err(error) = self.shared.store.heartbeat_instance() {
                 tracing::error!("database instance heartbeat failed: {error:#}");
+                if error.to_string() == INSTANCE_LOCK_LOST_ERROR {
+                    self.shared.shutdown.cancel();
+                    return;
+                }
             }
         }
     }
@@ -1678,7 +1684,7 @@ impl App {
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown: CancellationToken) {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -1687,11 +1693,15 @@ async fn shutdown_signal() {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}
+            _ = shutdown.cancelled() => {}
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = shutdown.cancelled() => {}
+        }
     }
 }
 
