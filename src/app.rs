@@ -235,6 +235,11 @@ impl App {
         self.notify_primary_user(&format!("🟢 Telecodex {} started", app_version_label()))
             .await;
 
+        let heartbeat_app = self.clone();
+        tokio::spawn(async move {
+            heartbeat_app.run_instance_heartbeat_loop().await;
+        });
+
         let maintenance_app = self.clone();
         tokio::spawn(async move {
             if let Err(error) = maintenance_app.run_background_maintenance_loop().await {
@@ -285,6 +290,18 @@ impl App {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    async fn run_instance_heartbeat_loop(&self) {
+        loop {
+            sleep(Duration::from_secs(
+                (Self::BACKGROUND_MAINTENANCE_INTERVAL_SECONDS / 2).max(1),
+            ))
+            .await;
+            if let Err(error) = self.shared.store.heartbeat_instance() {
+                tracing::error!("database instance heartbeat failed: {error:#}");
             }
         }
     }

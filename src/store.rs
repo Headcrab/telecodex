@@ -5,8 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
 
 use crate::{
     config::{CodexConfig, SearchMode},
@@ -15,6 +16,7 @@ use crate::{
 
 pub struct Store {
     conn: Mutex<Connection>,
+    instance_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -50,11 +52,15 @@ impl Store {
             .with_context(|| format!("failed to open sqlite database {}", db_path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        let instance_id = Uuid::now_v7().to_string();
         let store = Self {
             conn: Mutex::new(conn),
+            instance_id,
         };
         store.init_schema()?;
-        let recovered = store.recover_interrupted_turns()?;
+        let stale_cutoff = stale_instance_cutoff();
+        store.claim_instance_lock(&stale_cutoff)?;
+        let recovered = store.recover_interrupted_turns(&stale_cutoff)?;
         store.seed_admins(admin_ids)?;
         store.audit(
             None,
@@ -83,7 +89,54 @@ impl Store {
         Ok(store)
     }
 
-    fn recover_interrupted_turns(&self) -> Result<InterruptedTurnRecovery> {
+    fn claim_instance_lock(&self, stale_cutoff: &str) -> Result<()> {
+        let now = now_string();
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "INSERT INTO app_instance_lock(key, instance_id, heartbeat_at, acquired_at)
+             VALUES ('main', ?1, ?2, ?2)
+             ON CONFLICT(key) DO UPDATE
+             SET instance_id = excluded.instance_id,
+                 heartbeat_at = excluded.heartbeat_at,
+                 acquired_at = excluded.acquired_at
+             WHERE app_instance_lock.instance_id = excluded.instance_id
+                OR app_instance_lock.heartbeat_at < ?3",
+            params![self.instance_id, now, stale_cutoff],
+        )?;
+        if changed != 0 {
+            return Ok(());
+        }
+
+        let holder = conn
+            .query_row(
+                "SELECT instance_id, heartbeat_at FROM app_instance_lock WHERE key = 'main'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((holder_id, heartbeat_at)) = holder else {
+            return Err(anyhow!("failed to claim Telecodex database instance lock"));
+        };
+        Err(anyhow!(
+            "Telecodex database is already owned by live instance {holder_id} with heartbeat {heartbeat_at}"
+        ))
+    }
+
+    pub fn heartbeat_instance(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE app_instance_lock
+             SET heartbeat_at = ?2
+             WHERE key = 'main' AND instance_id = ?1",
+            params![self.instance_id, now_string()],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!("Telecodex database instance lock was lost"));
+        }
+        Ok(())
+    }
+
+    fn recover_interrupted_turns(&self, stale_cutoff: &str) -> Result<InterruptedTurnRecovery> {
         let now = now_string();
         let conn = self.conn.lock().expect("store mutex poisoned");
         let interrupted_turns = conn.execute(
@@ -91,14 +144,14 @@ impl Store {
              SET status = 'failed',
                  assistant_text = COALESCE(assistant_text, 'Telecodex restarted before this turn completed. Retry the request if it still matters.'),
                  completed_at = ?1
-             WHERE status = 'running'",
-            params![now],
+             WHERE status = 'running' AND started_at < ?2",
+            params![now, stale_cutoff],
         )?;
         let busy_sessions = conn.execute(
             "UPDATE sessions
              SET busy = 0, updated_at = ?1
-             WHERE busy != 0",
-            params![now],
+             WHERE busy != 0 AND updated_at < ?2",
+            params![now, stale_cutoff],
         )?;
         Ok(InterruptedTurnRecovery {
             interrupted_turns,
@@ -582,6 +635,13 @@ impl Store {
                 details_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS app_instance_lock(
+                key TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                acquired_at TEXT NOT NULL
+            );
             ",
         )?;
         add_column_if_missing(&conn, "sessions", "session_title", "TEXT")?;
@@ -629,6 +689,17 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Ok(conn) = self.conn.get_mut() {
+            let _ = conn.execute(
+                "DELETE FROM app_instance_lock WHERE key = 'main' AND instance_id = ?1",
+                params![self.instance_id],
+            );
+        }
     }
 }
 
@@ -700,6 +771,15 @@ fn now_string() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn stale_instance_cutoff() -> String {
+    let seconds = std::env::var("TELECODEX_INSTANCE_STALE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(120);
+    (Utc::now() - Duration::seconds(seconds)).to_rfc3339()
+}
+
 fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
@@ -743,6 +823,21 @@ mod tests {
             search_mode: SearchMode::Disabled,
             add_dirs: vec![],
         }
+    }
+
+    fn mark_turn_and_session_stale(db_path: &std::path::Path, turn_id: i64, key: SessionKey) {
+        let stale = (Utc::now() - Duration::seconds(300)).to_rfc3339();
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE turns SET started_at = ?1 WHERE id = ?2",
+            rusqlite::params![stale, turn_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE chat_id = ?2 AND thread_id = ?3",
+            rusqlite::params![stale, key.chat_id, key.thread_id],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -808,6 +903,7 @@ mod tests {
         let turn_id = store.record_turn_started(session.id, &request).unwrap();
         store.set_session_busy(session.key, true).unwrap();
         drop(store);
+        mark_turn_and_session_stale(tmp.path(), turn_id, session.key);
 
         let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
         let session = store.get_session(session.key).unwrap().unwrap();
@@ -817,6 +913,46 @@ mod tests {
             store.turn_status(turn_id).unwrap().as_deref(),
             Some("failed")
         );
+    }
+
+    #[test]
+    fn keeps_fresh_running_turns_on_startup() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store
+            .ensure_session(SessionKey::new(1, Some(10)), 100, &defaults())
+            .unwrap();
+        let request = TurnRequest {
+            session_key: session.key,
+            from_user_id: 100,
+            prompt: "hello".to_string(),
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode: None,
+            override_search_mode: None,
+        };
+        let turn_id = store.record_turn_started(session.id, &request).unwrap();
+        store.set_session_busy(session.key, true).unwrap();
+        drop(store);
+
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store.get_session(session.key).unwrap().unwrap();
+
+        assert!(session.busy);
+        assert_eq!(
+            store.turn_status(turn_id).unwrap().as_deref(),
+            Some("running")
+        );
+    }
+
+    #[test]
+    fn refuses_second_live_instance() {
+        let tmp = NamedTempFile::new().unwrap();
+        let _store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let second = Store::open(tmp.path(), &[100], &defaults());
+
+        assert!(second.is_err());
+        assert!(format!("{:#}", second.err().unwrap()).contains("already owned by live instance"));
     }
 
     #[test]
