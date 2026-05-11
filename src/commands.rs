@@ -226,7 +226,7 @@ pub fn command_help(command: &str, args: &str) -> Option<CommandHelp> {
             "Usage: /history\n\nShows an interactive pager for messages from the selected Codex session.",
         )),
         "/retry" | "/retry_turn" | "/retry-turn" => Some(text_help(
-            "Usage: /retry <turn_id>\n\nRetries a failed turn without attachments.",
+            "Usage: /retry <turn_id>\n\nRetries a failed or cancelled turn without attachments.",
         )),
         "/add-dir" | "/add_dir" => Some(text_help(
             "Usage: /add-dir <absolute_path>\n\nExample:\n/add-dir /absolute/path/to/workspace",
@@ -263,7 +263,7 @@ pub fn default_bot_commands() -> Vec<BotCommand> {
         bot_command("copy", "Resend the last assistant reply"),
         bot_command("clear", "Start a fresh Codex session on the next turn"),
         bot_command("stop", "Stop the active turn"),
-        bot_command("retry", "Retry a failed turn"),
+        bot_command("retry", "Retry a failed or cancelled turn"),
         bot_command("restart_bot", "Admin: restart the bot process"),
         bot_command("allow", "Admin: allow a Telegram user"),
         bot_command("deny", "Admin: deny a Telegram user"),
