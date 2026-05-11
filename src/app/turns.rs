@@ -29,20 +29,14 @@ pub(super) async fn process_turn(
         Some(session.key.thread_id).filter(|value| *value != 0),
         cancel.clone(),
     );
-    let limits_inline = match latest_limits_snapshot_from_shared(&shared).await {
-        Ok(snapshot) => snapshot.and_then(|snapshot| format_limits_inline(&snapshot)),
-        Err(error) => {
-            *cancel_slot.lock().expect("cancel mutex poisoned") = None;
-            cancel.cancel();
-            let _ = chat_action_task.await;
-            finish_pre_codex_turn_failure(&shared, &session, turn_id, &error)?;
-            return finish_turn_cleanup(
-                &queued.request.attachments,
-                &turn_workspace.root,
-                Err(error),
-            );
-        }
-    };
+    let limits_inline = latest_limits_snapshot_from_shared(&shared)
+        .await
+        .map_err(|error| {
+            tracing::warn!("failed to read latest limits snapshot: {error:#}");
+            error
+        })
+        .ok()
+        .and_then(|snapshot| snapshot.and_then(|snapshot| format_limits_inline(&snapshot)));
     let thinking_text = "⏳";
     let placeholder_text = render_placeholder_html(thinking_text, limits_inline.as_deref());
 
