@@ -1,5 +1,8 @@
 use super::*;
-use std::{path::Path, process::Stdio};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 pub(super) fn app_version_label() -> String {
     format!(
@@ -146,7 +149,10 @@ pub(super) fn active_session_identity(
 
 #[cfg(windows)]
 pub(super) fn spawn_restarted_process() -> Result<()> {
-    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if is_systemd_managed_process() {
+        return Ok(());
+    }
+    let exe = restart_executable()?;
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
     let mut command = std::process::Command::new(exe);
@@ -169,7 +175,10 @@ pub(super) fn spawn_restarted_process() -> Result<()> {
 
 #[cfg(not(windows))]
 pub(super) fn spawn_restarted_process() -> Result<()> {
-    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if is_systemd_managed_process() {
+        return Ok(());
+    }
+    let exe = restart_executable()?;
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
     let mut command = std::process::Command::new(exe);
@@ -182,6 +191,27 @@ pub(super) fn spawn_restarted_process() -> Result<()> {
         .stderr(Stdio::null());
     command.spawn().context("failed to spawn restarted bot")?;
     Ok(())
+}
+
+fn is_systemd_managed_process() -> bool {
+    std::env::var_os("SYSTEMD_EXEC_PID").is_some()
+}
+
+fn restart_executable() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+
+    let exe_text = exe.as_os_str().to_string_lossy();
+    if let Some(stripped) = exe_text.strip_suffix(" (deleted)") {
+        let replacement = PathBuf::from(stripped);
+        if replacement.exists() {
+            return Ok(replacement);
+        }
+    }
+
+    Ok(exe)
 }
 
 pub(super) fn ensure_admin(user: &crate::models::UserRecord) -> Result<()> {

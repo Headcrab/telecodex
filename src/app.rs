@@ -249,10 +249,12 @@ impl App {
 
         let mut offset = self.shared.store.last_update_id()?.map(|value| value + 1);
         tracing::info!("telecodex started {}", app_version_label());
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                _ = &mut shutdown => {
                     tracing::info!("shutdown signal received");
                     self.notify_primary_user(&format!("🔴 Telecodex {} stopped", app_version_label()))
                         .await;
@@ -1274,8 +1276,14 @@ impl App {
                         app_version_label()
                     ))
                     .await;
+                    let shared = self.shared.clone();
                     tokio::spawn(async move {
                         sleep(Duration::from_millis(750)).await;
+                        if let Err(error) = shared.store.release_instance_lock() {
+                            tracing::warn!(
+                                "failed to release database instance lock before restart: {error:#}"
+                            );
+                        }
                         std::process::exit(0);
                     });
                 }
@@ -1667,6 +1675,23 @@ impl App {
             Duration::from_secs(Self::HISTORY_PAGE_CACHE_TTL_SECONDS),
             Self::HISTORY_PAGE_CACHE_MAX_ENTRIES,
         );
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

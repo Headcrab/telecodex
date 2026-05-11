@@ -136,6 +136,11 @@ impl Store {
         Ok(())
     }
 
+    pub fn release_instance_lock(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        release_instance_lock_for(&conn, &self.instance_id)
+    }
+
     fn recover_interrupted_turns(&self, stale_cutoff: &str) -> Result<InterruptedTurnRecovery> {
         let now = now_string();
         let conn = self.conn.lock().expect("store mutex poisoned");
@@ -695,10 +700,7 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         if let Ok(conn) = self.conn.get_mut() {
-            let _ = conn.execute(
-                "DELETE FROM app_instance_lock WHERE key = 'main' AND instance_id = ?1",
-                params![self.instance_id],
-            );
+            let _ = release_instance_lock_for(conn, &self.instance_id);
         }
     }
 }
@@ -769,6 +771,14 @@ fn add_column_if_missing(
 
 fn now_string() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn release_instance_lock_for(conn: &Connection, instance_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM app_instance_lock WHERE key = 'main' AND instance_id = ?1",
+        params![instance_id],
+    )?;
+    Ok(())
 }
 
 fn stale_instance_cutoff() -> String {
