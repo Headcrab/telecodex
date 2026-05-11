@@ -58,7 +58,7 @@ No webhook infrastructure. No browser dependency. No cloud relay between Telegra
 - Polls Telegram Bot API via `getUpdates`.
 - Maintains one logical session per Telegram chat/topic pair.
 - Queues turns per session and streams progress by editing Telegram messages in place.
-- Supports `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, and per-session runtime settings.
+- Supports `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, `/retry`, and per-session runtime settings.
 - Can bind a Telegram topic to an existing Codex thread by thread id or `latest`.
 - In the primary forum dashboard, environments are listed for import and topics are created on button click by default.
 
@@ -143,6 +143,7 @@ High-level flow:
 | `/history` | Browse final assistant messages from the selected Codex session with an interactive pager |
 | `/status` | Show the current Telegram session, selected Codex session, and runtime settings |
 | `/stop` | Stop the active turn |
+| `/retry <turn_id>` | Retry a failed or cancelled turn without attachments |
 | `/model [model\|default\|-]` | Set or show the current model |
 | `/think [minimal\|low\|medium\|high\|default\|-]` | Set or show reasoning effort |
 | `/prompt [text\|clear\|default\|-]` | Set or clear the persistent session prompt |

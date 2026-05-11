@@ -64,6 +64,7 @@ pub(super) fn command_uses_session_context(parsed: &ParsedInput) -> bool {
                 | BridgeCommand::Limits
                 | BridgeCommand::Copy
                 | BridgeCommand::Clear
+                | BridgeCommand::RetryTurn { .. }
                 | BridgeCommand::Unsupported { .. }
         ),
     }
@@ -72,7 +73,9 @@ pub(super) fn command_uses_session_context(parsed: &ParsedInput) -> bool {
 pub(super) fn parsed_input_requires_codex_auth(parsed: &ParsedInput) -> bool {
     matches!(
         parsed,
-        ParsedInput::Forward(_) | ParsedInput::Bridge(BridgeCommand::Review(_))
+        ParsedInput::Forward(_)
+            | ParsedInput::Bridge(BridgeCommand::Review(_))
+            | ParsedInput::Bridge(BridgeCommand::RetryTurn { .. })
     )
 }
 

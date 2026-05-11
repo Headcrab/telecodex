@@ -891,6 +891,26 @@ impl App {
                         .await?;
                     }
                 }
+                BridgeCommand::RetryTurn { turn_id } => {
+                    let Some(mut request) = self.shared.store.retry_request_for_turn(
+                        turn_id,
+                        session_key,
+                        user.tg_user_id,
+                    )?
+                    else {
+                        self.send_status(
+                            message.chat.id,
+                            message.message_thread_id,
+                            &format!("Turn `{turn_id}` is not retryable in this session."),
+                        )
+                        .await?;
+                        return Ok(());
+                    };
+                    if request.review_mode.is_none() {
+                        request.override_search_mode = auto_search_mode_for_prompt(&request.prompt);
+                    }
+                    self.enqueue_turn(request, &message.chat.kind).await?;
+                }
                 BridgeCommand::Allow { user_id } => {
                     ensure_admin(user)?;
                     let role = self

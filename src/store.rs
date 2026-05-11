@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     config::{CodexConfig, SearchMode},
-    models::{SessionKey, SessionRecord, TurnRequest, UserRecord, UserRole},
+    models::{ReviewRequest, SessionKey, SessionRecord, TurnRequest, UserRecord, UserRole},
 };
 
 pub struct Store {
@@ -54,12 +54,24 @@ impl Store {
             conn: Mutex::new(conn),
         };
         store.init_schema()?;
+        let recovered = store.recover_interrupted_turns()?;
         store.seed_admins(admin_ids)?;
         store.audit(
             None,
             "startup",
-            serde_json::json!({ "admins_seeded": admin_ids }),
+            serde_json::json!({
+                "admins_seeded": admin_ids,
+                "interrupted_turns_recovered": recovered.interrupted_turns,
+                "busy_sessions_recovered": recovered.busy_sessions,
+            }),
         )?;
+        if recovered.interrupted_turns > 0 || recovered.busy_sessions > 0 {
+            tracing::warn!(
+                "recovered {} interrupted turns and {} busy sessions from a previous process",
+                recovered.interrupted_turns,
+                recovered.busy_sessions
+            );
+        }
         if admin_ids.is_empty() {
             tracing::warn!(
                 "startup_admin_ids is empty; the bot will deny everyone until an admin is inserted manually"
@@ -69,6 +81,29 @@ impl Store {
             return Err(anyhow!("default cwd is empty"));
         }
         Ok(store)
+    }
+
+    fn recover_interrupted_turns(&self) -> Result<InterruptedTurnRecovery> {
+        let now = now_string();
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let interrupted_turns = conn.execute(
+            "UPDATE turns
+             SET status = 'failed',
+                 assistant_text = COALESCE(assistant_text, 'Telecodex restarted before this turn completed. Retry the request if it still matters.'),
+                 completed_at = ?1
+             WHERE status = 'running'",
+            params![now],
+        )?;
+        let busy_sessions = conn.execute(
+            "UPDATE sessions
+             SET busy = 0, updated_at = ?1
+             WHERE busy != 0",
+            params![now],
+        )?;
+        Ok(InterruptedTurnRecovery {
+            interrupted_turns,
+            busy_sessions,
+        })
     }
 
     pub fn last_update_id(&self) -> Result<Option<i64>> {
@@ -410,6 +445,48 @@ impl Store {
         Ok(())
     }
 
+    pub fn retry_request_for_turn(
+        &self,
+        turn_id: i64,
+        session_key: SessionKey,
+        from_user_id: i64,
+    ) -> Result<Option<TurnRequest>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT t.prompt, t.review_json, t.status
+                 FROM turns t
+                 JOIN sessions s ON s.id = t.session_id
+                 WHERE t.id = ?1 AND s.chat_id = ?2 AND s.thread_id = ?3",
+                params![turn_id, session_key.chat_id, session_key.thread_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((prompt, review_json, status)) = row else {
+            return Ok(None);
+        };
+        if !matches!(status.as_str(), "failed" | "cancelled") {
+            return Ok(None);
+        }
+        let review_mode: Option<ReviewRequest> = serde_json::from_str(&review_json)
+            .with_context(|| format!("failed to parse review request for turn {turn_id}"))?;
+        Ok(Some(TurnRequest {
+            session_key,
+            from_user_id,
+            prompt,
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode,
+            override_search_mode: None,
+        }))
+    }
+
     pub fn set_last_assistant_text(&self, key: SessionKey, text: Option<&str>) -> Result<()> {
         self.update_session_field(
             key,
@@ -553,6 +630,12 @@ impl Store {
         .optional()
         .map_err(Into::into)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InterruptedTurnRecovery {
+    interrupted_turns: usize,
+    busy_sessions: usize,
 }
 
 fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -704,5 +787,71 @@ mod tests {
             .unwrap();
         let last = store.last_assistant_text(session.key).unwrap();
         assert!(last.is_none());
+    }
+
+    #[test]
+    fn recovers_interrupted_turns_on_startup() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store
+            .ensure_session(SessionKey::new(1, Some(10)), 100, &defaults())
+            .unwrap();
+        let request = TurnRequest {
+            session_key: session.key,
+            from_user_id: 100,
+            prompt: "hello".to_string(),
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode: None,
+            override_search_mode: None,
+        };
+        let turn_id = store.record_turn_started(session.id, &request).unwrap();
+        store.set_session_busy(session.key, true).unwrap();
+        drop(store);
+
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store.get_session(session.key).unwrap().unwrap();
+
+        assert!(!session.busy);
+        assert_eq!(
+            store.turn_status(turn_id).unwrap().as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn builds_retry_request_for_failed_turn() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store
+            .ensure_session(SessionKey::new(1, Some(10)), 100, &defaults())
+            .unwrap();
+        let request = TurnRequest {
+            session_key: session.key,
+            from_user_id: 100,
+            prompt: "hello".to_string(),
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode: Some(ReviewRequest {
+                base: Some("main".to_string()),
+                commit: None,
+                uncommitted: false,
+                title: None,
+                prompt: Some("review this".to_string()),
+            }),
+            override_search_mode: None,
+        };
+        let turn_id = store.record_turn_started(session.id, &request).unwrap();
+        store.record_turn_finished(turn_id, "failed", None).unwrap();
+
+        let retry = store
+            .retry_request_for_turn(turn_id, session.key, 200)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(retry.from_user_id, 200);
+        assert_eq!(retry.prompt, "hello");
+        assert!(retry.attachments.is_empty());
+        assert_eq!(retry.review_mode.unwrap().base.as_deref(), Some("main"));
     }
 }

@@ -136,6 +136,17 @@ fn formats_turn_completion_notification() {
 }
 
 #[test]
+fn builds_rate_limit_retry_keyboard() {
+    let keyboard = rate_limit_retry_keyboard(42);
+
+    assert_eq!(keyboard.inline_keyboard[0][0].text, "Retry");
+    assert_eq!(
+        keyboard.inline_keyboard[0][0].callback_data.as_deref(),
+        Some("cmd:/retry 42")
+    );
+}
+
+#[test]
 fn detects_stale_codex_thread_errors_in_error_context() {
     let error = anyhow::anyhow!("codex turn failed")
         .context("no rollout found for thread id 019abc | code -32600");

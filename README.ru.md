@@ -58,7 +58,7 @@
 - Поллит Telegram Bot API через `getUpdates`.
 - Держит одну логическую сессию на пару chat/topic.
 - Ставит ходы в очередь по сессии и стримит прогресс через редактирование сообщений.
-- Поддерживает `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop` и настройки рантайма на уровне сессии.
+- Поддерживает `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, `/retry` и настройки рантайма на уровне сессии.
 - Может привязать Telegram topic к существующему Codex thread по id или `latest`.
 - В primary forum dashboard окружения показываются для импорта, а topic создаётся по нажатию кнопки по умолчанию.
 
@@ -143,6 +143,7 @@ Telegram chat/topic
 | `/history` | Листать итоговые сообщения ассистента из выбранной Codex-сессии через интерактивный pager |
 | `/status` | Показать текущую Telegram-сессию, выбранную Codex-сессию и runtime-настройки |
 | `/stop` | Остановить активный ход |
+| `/retry <turn_id>` | Повторить failed или cancelled ход без вложений |
 | `/model [model\|default\|-]` | Поставить или показать модель |
 | `/think [minimal\|low\|medium\|high\|default\|-]` | Поставить или показать reasoning effort |
 | `/prompt [text\|clear\|default\|-]` | Поставить или очистить постоянный session prompt |

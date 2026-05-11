@@ -29,9 +29,20 @@ pub(super) async fn process_turn(
         Some(session.key.thread_id).filter(|value| *value != 0),
         cancel.clone(),
     );
-    let limits_inline = latest_limits_snapshot_from_shared(&shared)
-        .await?
-        .and_then(|snapshot| format_limits_inline(&snapshot));
+    let limits_inline = match latest_limits_snapshot_from_shared(&shared).await {
+        Ok(snapshot) => snapshot.and_then(|snapshot| format_limits_inline(&snapshot)),
+        Err(error) => {
+            *cancel_slot.lock().expect("cancel mutex poisoned") = None;
+            cancel.cancel();
+            let _ = chat_action_task.await;
+            finish_pre_codex_turn_failure(&shared, &session, turn_id, &error)?;
+            return finish_turn_cleanup(
+                &queued.request.attachments,
+                &turn_workspace.root,
+                Err(error),
+            );
+        }
+    };
     let thinking_text = "⏳";
     let placeholder_text = render_placeholder_html(thinking_text, limits_inline.as_deref());
 
@@ -51,7 +62,7 @@ pub(super) async fn process_turn(
         }
     }
 
-    let placeholder = shared
+    let placeholder = match shared
         .telegram
         .send_message(SendMessage::html(
             session.key.chat_id,
@@ -59,7 +70,30 @@ pub(super) async fn process_turn(
             placeholder_text,
         ))
         .await
-        .context("failed to create placeholder message")?;
+        .context("failed to create placeholder message")
+    {
+        Ok(placeholder) => placeholder,
+        Err(error) => {
+            *cancel_slot.lock().expect("cancel mutex poisoned") = None;
+            cancel.cancel();
+            let _ = chat_action_task.await;
+            if let Some(retry_after) = telegram_retry_after(&error) {
+                notify_pre_codex_rate_limit(
+                    shared.clone(),
+                    session.key,
+                    turn_id,
+                    retry_after,
+                    queued.request.attachments.is_empty(),
+                );
+            }
+            finish_pre_codex_turn_failure(&shared, &session, turn_id, &error)?;
+            return finish_turn_cleanup(
+                &queued.request.attachments,
+                &turn_workspace.root,
+                Err(error),
+            );
+        }
+    };
     let sink = Arc::new(Mutex::new(LiveTurnSink::new(
         shared.clone(),
         &session,
@@ -306,6 +340,88 @@ async fn finish_failed_turn(
     Ok(())
 }
 
+fn finish_pre_codex_turn_failure(
+    shared: &Arc<AppShared>,
+    session: &crate::models::SessionRecord,
+    turn_id: i64,
+    error: &anyhow::Error,
+) -> Result<()> {
+    shared.store.set_session_busy(session.key, false)?;
+    let assistant_text = if let Some(retry_after) = telegram_retry_after(error) {
+        format!(
+            "Telegram rate limit prevented this turn from starting. Retry after {retry_after}s."
+        )
+    } else {
+        format!("Turn failed before Codex started: {error:#}")
+    };
+    shared
+        .store
+        .record_turn_finished(turn_id, "failed", Some(&assistant_text))?;
+    Ok(())
+}
+
+fn notify_pre_codex_rate_limit(
+    shared: Arc<AppShared>,
+    session_key: SessionKey,
+    turn_id: i64,
+    retry_after: u64,
+    can_retry: bool,
+) {
+    tokio::spawn(async move {
+        let mut wait_seconds = retry_after.saturating_add(1);
+        for attempt in 0..3 {
+            sleep(Duration::from_secs(wait_seconds)).await;
+            let mut request = SendMessage::html(
+                session_key.chat_id,
+                Some(session_key.thread_id).filter(|value| *value != 0),
+                render_pre_codex_rate_limit_notice(turn_id, retry_after, can_retry),
+            );
+            if can_retry {
+                request.reply_markup = Some(rate_limit_retry_keyboard(turn_id));
+            }
+            match shared.telegram.send_message(request).await {
+                Ok(_) => return,
+                Err(error) => {
+                    if let Some(next_retry_after) = telegram_retry_after(&error) {
+                        wait_seconds = next_retry_after.saturating_add(1);
+                        tracing::warn!(
+                            "Telegram still rate-limited retry notice for turn {turn_id}; attempt {} retry after {next_retry_after}s",
+                            attempt + 1
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        "failed to send Telegram rate-limit retry notice for turn {turn_id}: {error:#}"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn render_pre_codex_rate_limit_notice(turn_id: i64, retry_after: u64, can_retry: bool) -> String {
+    let retry_line = if can_retry {
+        "I waited for the recommended backoff. Use Retry to send the same prompt again."
+    } else {
+        "I waited for the recommended backoff. Send the request again manually because attachments cannot be retried."
+    };
+    format!(
+        "Telegram rate limit hit before Codex could start turn <code>{turn_id}</code>.\n\
+         Telegram asked to retry after <code>{retry_after}s</code>.\n\n{retry_line}"
+    )
+}
+
+pub(super) fn rate_limit_retry_keyboard(turn_id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton {
+            text: "Retry".to_string(),
+            callback_data: Some(format!("cmd:/retry {turn_id}")),
+            url: None,
+        }]],
+    }
+}
+
 async fn notify_turn_completion(shared: &Arc<AppShared>, session_key: SessionKey) {
     let Some(text) =
         turn_completion_notification_text(&shared.config.telegram.completion_notify_usernames)
@@ -459,7 +575,7 @@ impl LiveTurnSink {
             if let Some(existing) = self.messages.get(idx).cloned() {
                 self.edit_message(existing, chunk, &html).await?;
             } else {
-                let message = self
+                let result = self
                     .shared
                     .telegram
                     .send_message(SendMessage::html(
@@ -467,7 +583,14 @@ impl LiveTurnSink {
                         Some(self.session_key.thread_id).filter(|value| *value != 0),
                         html.clone(),
                     ))
-                    .await?;
+                    .await;
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) if self.defer_after_retry_after(&error, "telegram send chunk") => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
                 let reference = TelegramMessageRef {
                     chat_id: self.session_key.chat_id,
                     message_id: message.message_id,
