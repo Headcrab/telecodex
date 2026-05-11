@@ -59,6 +59,7 @@ pub(super) fn command_uses_session_context(parsed: &ParsedInput) -> bool {
                 | BridgeCommand::Pwd
                 | BridgeCommand::Model { .. }
                 | BridgeCommand::Think { .. }
+                | BridgeCommand::Fast { .. }
                 | BridgeCommand::Prompt { .. }
                 | BridgeCommand::Approval { .. }
                 | BridgeCommand::Sandbox { .. }

@@ -37,8 +37,9 @@ pub(super) async fn process_turn(
         })
         .ok()
         .and_then(|snapshot| snapshot.and_then(|snapshot| format_limits_inline(&snapshot)));
+    let turn_banner = turn_start_banner(limits_inline, &session);
     let thinking_text = "⏳";
-    let placeholder_text = render_placeholder_html(thinking_text, limits_inline.as_deref());
+    let placeholder_text = render_placeholder_html(thinking_text, turn_banner.as_deref());
 
     if shared.config.telegram.use_message_drafts && queued.chat_kind == "private" {
         if let Err(error) = shared
@@ -91,7 +92,7 @@ pub(super) async fn process_turn(
     let sink = Arc::new(Mutex::new(LiveTurnSink::new(
         shared.clone(),
         &session,
-        limits_inline,
+        turn_banner,
         TelegramMessageRef {
             chat_id: session.key.chat_id,
             message_id: placeholder.message_id,
@@ -694,6 +695,26 @@ fn render_placeholder_html(status: &str, limits_banner: Option<&str>) -> String 
     }
 }
 
+fn turn_start_banner(
+    limits_inline: Option<String>,
+    session: &crate::models::SessionRecord,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(limits_inline) = limits_inline.filter(|value| !value.trim().is_empty()) {
+        lines.push(limits_inline);
+    }
+    if session.service_tier.as_deref() == Some("fast") {
+        lines.push(
+            "⚡ Fast mode is ON for this session; Codex may use faster inference with higher plan usage. Disable it with `/fast off`.".to_string(),
+        );
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 fn progress_status_text(text: &str) -> String {
     let text = text.trim();
     if text.is_empty() {
@@ -1172,5 +1193,50 @@ fn mime_type_for_path(path: &Path) -> Option<String> {
         "md" => Some("text/markdown".to_string()),
         "json" => Some("application/json".to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SearchMode;
+
+    fn session_with_service_tier(service_tier: Option<&str>) -> crate::models::SessionRecord {
+        crate::models::SessionRecord {
+            id: 1,
+            key: SessionKey::new(1, Some(2)),
+            session_title: None,
+            codex_thread_id: None,
+            force_fresh_thread: false,
+            updated_at: "2026-03-13T10:00:00Z".to_string(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            reasoning_effort: None,
+            service_tier: service_tier.map(ToOwned::to_owned),
+            session_prompt: None,
+            sandbox_mode: "workspace-write".to_string(),
+            approval_policy: "never".to_string(),
+            search_mode: SearchMode::Disabled,
+            add_dirs: vec![],
+            busy: false,
+        }
+    }
+
+    #[test]
+    fn turn_start_banner_mentions_fast_mode() {
+        let session = session_with_service_tier(Some("fast"));
+        let banner = turn_start_banner(Some("Limits: ok".to_string()), &session).unwrap();
+
+        assert!(banner.contains("Limits: ok"));
+        assert!(banner.contains("⚡ Fast mode is ON"));
+        assert!(banner.contains("/fast off"));
+    }
+
+    #[test]
+    fn turn_start_banner_omits_fast_mode_when_disabled() {
+        let session = session_with_service_tier(None);
+        let banner = turn_start_banner(Some("Limits: ok".to_string()), &session).unwrap();
+
+        assert_eq!(banner, "Limits: ok");
     }
 }

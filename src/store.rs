@@ -291,7 +291,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.query_row(
             "SELECT id, chat_id, thread_id, session_title, codex_thread_id, force_fresh_thread, cwd, model, reasoning_effort, session_prompt, sandbox_mode, approval_policy,
-                    search_mode, add_dirs_json, creator_user_id, busy, last_assistant_text, updated_at
+                    search_mode, add_dirs_json, creator_user_id, busy, last_assistant_text, updated_at, service_tier
              FROM sessions
              WHERE chat_id = ?1 AND thread_id = ?2",
             params![key.chat_id, key.thread_id],
@@ -305,7 +305,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, thread_id, session_title, codex_thread_id, force_fresh_thread, cwd, model, reasoning_effort, session_prompt, sandbox_mode, approval_policy,
-                    search_mode, add_dirs_json, creator_user_id, busy, last_assistant_text, updated_at
+                    search_mode, add_dirs_json, creator_user_id, busy, last_assistant_text, updated_at, service_tier
              FROM sessions
              WHERE chat_id = ?1
              ORDER BY updated_at DESC, id DESC",
@@ -364,7 +364,8 @@ impl Store {
                  approval_policy = ?11,
                  search_mode = ?12,
                  add_dirs_json = ?13,
-                 updated_at = ?14
+                 service_tier = ?14,
+                 updated_at = ?15
              WHERE chat_id = ?1 AND thread_id = ?2",
             params![
                 key.chat_id,
@@ -380,6 +381,7 @@ impl Store {
                 template.approval_policy,
                 template.search_mode.as_codex_value(),
                 add_dirs,
+                template.service_tier.as_deref(),
                 now_string(),
             ],
         )
@@ -425,6 +427,18 @@ impl Store {
             key,
             "UPDATE sessions SET reasoning_effort = ?3, updated_at = ?4 WHERE chat_id = ?1 AND thread_id = ?2",
             params![key.chat_id, key.thread_id, reasoning_effort, now_string()],
+        )
+    }
+
+    pub fn set_session_service_tier(
+        &self,
+        key: SessionKey,
+        service_tier: Option<&str>,
+    ) -> Result<()> {
+        self.update_session_field(
+            key,
+            "UPDATE sessions SET service_tier = ?3, updated_at = ?4 WHERE chat_id = ?1 AND thread_id = ?2",
+            params![key.chat_id, key.thread_id, service_tier, now_string()],
         )
     }
 
@@ -604,6 +618,7 @@ impl Store {
                 cwd TEXT NOT NULL,
                 model TEXT,
                 reasoning_effort TEXT,
+                service_tier TEXT,
                 session_prompt TEXT,
                 sandbox_mode TEXT NOT NULL,
                 approval_policy TEXT NOT NULL,
@@ -653,6 +668,7 @@ impl Store {
         )?;
         add_column_if_missing(&conn, "sessions", "session_title", "TEXT")?;
         add_column_if_missing(&conn, "sessions", "reasoning_effort", "TEXT")?;
+        add_column_if_missing(&conn, "sessions", "service_tier", "TEXT")?;
         add_column_if_missing(&conn, "sessions", "session_prompt", "TEXT")?;
         add_column_if_missing(
             &conn,
@@ -732,6 +748,7 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         cwd: normalize_path(PathBuf::from(row.get::<_, String>(6)?)),
         model: row.get(7)?,
         reasoning_effort: row.get(8)?,
+        service_tier: row.get(18)?,
         session_prompt: row.get(9)?,
         sandbox_mode: row.get(10)?,
         approval_policy: row.get(11)?,

@@ -35,6 +35,7 @@ pub enum BridgeCommand {
     Role { user_id: i64, role: String },
     Model { model: Option<String> },
     Think { level: Option<String> },
+    Fast { mode: FastMode },
     Prompt { prompt: Option<String> },
     Approval { approval: String },
     Sandbox { sandbox: String },
@@ -45,6 +46,13 @@ pub enum BridgeCommand {
     Clear,
     RestartBot,
     Unsupported { command: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastMode {
+    Status,
+    On,
+    Off,
 }
 
 const FORWARDED_COMMANDS: &[&str] = &[
@@ -130,6 +138,9 @@ pub fn parse_command(command: &str, args: &str, original_text: &str) -> Result<P
         "/think" => BridgeCommand::Think {
             level: non_empty(args).map(ToOwned::to_owned),
         },
+        "/fast" => BridgeCommand::Fast {
+            mode: parse_fast_mode(args)?,
+        },
         "/prompt" => BridgeCommand::Prompt {
             prompt: non_empty(args).map(ToOwned::to_owned),
         },
@@ -189,6 +200,10 @@ pub fn command_help(command: &str, args: &str) -> Option<CommandHelp> {
                 "/think high",
                 "/think default",
             ],
+        )),
+        "/fast" => Some(choice_help(
+            "Fast mode",
+            &["/fast on", "/fast off", "/fast status"],
         )),
         "/role" => {
             let mut parts = args.split_whitespace();
@@ -250,6 +265,7 @@ pub fn default_bot_commands() -> Vec<BotCommand> {
         bot_command("pwd", "Show current working directory"),
         bot_command("model", "Set or show current model"),
         bot_command("think", "Set or show reasoning effort"),
+        bot_command("fast", "Set or show fast mode"),
         bot_command("prompt", "Set or show session prompt"),
         bot_command("approval", "Set approval policy"),
         bot_command("sandbox", "Set sandbox mode"),
@@ -320,6 +336,15 @@ fn parse_search_mode(value: &str) -> Result<SearchMode> {
         "cached" => Ok(SearchMode::Cached),
         "off" | "disabled" => Ok(SearchMode::Disabled),
         _ => bail!("/search <on|off|cached>"),
+    }
+}
+
+fn parse_fast_mode(value: &str) -> Result<FastMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "status" => Ok(FastMode::Status),
+        "on" | "true" | "1" | "fast" => Ok(FastMode::On),
+        "off" | "false" | "0" | "default" | "clear" | "-" => Ok(FastMode::Off),
+        _ => bail!("/fast [on|off|status]"),
     }
 }
 
@@ -417,6 +442,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_fast_command() {
+        let parsed = parse_command("/fast", "on", "/fast on").unwrap();
+        match parsed {
+            ParsedInput::Bridge(BridgeCommand::Fast { mode }) => {
+                assert_eq!(mode, FastMode::On);
+            }
+            _ => panic!("unexpected fast variant"),
+        }
+
+        let parsed = parse_command("/fast", "", "/fast").unwrap();
+        match parsed {
+            ParsedInput::Bridge(BridgeCommand::Fast { mode }) => {
+                assert_eq!(mode, FastMode::Status);
+            }
+            _ => panic!("unexpected fast status variant"),
+        }
+    }
+
+    #[test]
     fn parses_restart_bot_command() {
         let parsed = parse_command("/restart_bot", "", "/restart_bot").unwrap();
         match parsed {
@@ -489,6 +533,7 @@ mod tests {
             ("/pwd", ParsedInputKind::Bridge),
             ("/model gpt-5.4", ParsedInputKind::Bridge),
             ("/think high", ParsedInputKind::Bridge),
+            ("/fast on", ParsedInputKind::Bridge),
             ("/prompt be concise", ParsedInputKind::Bridge),
             ("/approval never", ParsedInputKind::Bridge),
             ("/sandbox workspace-write", ParsedInputKind::Bridge),

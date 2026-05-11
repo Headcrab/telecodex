@@ -37,7 +37,8 @@ use crate::{
         list_threads_for_cwd, read_thread_history,
     },
     commands::{
-        BridgeCommand, CommandHelp, ParsedInput, command_help, default_bot_commands, parse_command,
+        BridgeCommand, CommandHelp, FastMode, ParsedInput, command_help, default_bot_commands,
+        parse_command,
     },
     config::Config,
     limits::{
@@ -1104,6 +1105,54 @@ impl App {
                             },
                         )
                         .await?;
+                    }
+                }
+                BridgeCommand::Fast { mode } => {
+                    let session = self.ensure_session(session_key, user.tg_user_id)?;
+                    match mode {
+                        FastMode::Status => {
+                            let label = if session.service_tier.as_deref() == Some("fast") {
+                                "on"
+                            } else {
+                                "off"
+                            };
+                            self.send_command_help(
+                                message.chat.id,
+                                message.message_thread_id,
+                                &CommandHelp {
+                                    text: format!(
+                                        "Fast mode is `{label}` for this session.\n\nFast mode asks Codex to use faster inference with increased plan usage."
+                                    ),
+                                    quick_commands: vec![vec![
+                                        "/fast on".to_string(),
+                                        "/fast off".to_string(),
+                                    ]],
+                                },
+                            )
+                            .await?;
+                        }
+                        FastMode::On => {
+                            self.shared
+                                .store
+                                .set_session_service_tier(session_key, Some("fast"))?;
+                            self.send_status(
+                                message.chat.id,
+                                message.message_thread_id,
+                                "⚡ Fast mode enabled for this session. Disable with `/fast off`.",
+                            )
+                            .await?;
+                        }
+                        FastMode::Off => {
+                            self.shared
+                                .store
+                                .set_session_service_tier(session_key, None)?;
+                            self.send_status(
+                                message.chat.id,
+                                message.message_thread_id,
+                                "Fast mode disabled for this session.",
+                            )
+                            .await?;
+                        }
                     }
                 }
                 BridgeCommand::Prompt { prompt } => {

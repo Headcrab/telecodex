@@ -58,7 +58,7 @@
 - Поллит Telegram Bot API через `getUpdates`.
 - Держит одну логическую сессию на пару chat/topic.
 - Ставит ходы в очередь по сессии и стримит прогресс через редактирование сообщений.
-- Поддерживает `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, `/retry` и настройки рантайма на уровне сессии.
+- Поддерживает `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, `/retry`, `/fast` и настройки рантайма на уровне сессии.
 - Может привязать Telegram topic к существующему Codex thread по id или `latest`.
 - В primary forum dashboard окружения показываются для импорта, а topic создаётся по нажатию кнопки по умолчанию.
 
@@ -146,6 +146,7 @@ Telegram chat/topic
 | `/retry <turn_id>` | Повторить failed или cancelled ход без вложений |
 | `/model [model\|default\|-]` | Поставить или показать модель |
 | `/think [minimal\|low\|medium\|high\|default\|-]` | Поставить или показать reasoning effort |
+| `/fast [on\|off\|status]` | Поставить или показать fast mode для этой сессии |
 | `/prompt [text\|clear\|default\|-]` | Поставить или очистить постоянный session prompt |
 | `/approval <never\|on-request\|untrusted>` | Поставить approval policy |
 | `/sandbox <read-only\|workspace-write\|danger-full-access>` | Поставить sandbox mode |

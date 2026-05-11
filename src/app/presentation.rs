@@ -824,6 +824,11 @@ pub(super) fn format_session_status(
         .and_then(|value| value.reasoning_effort.as_deref())
         .or(session.reasoning_effort.as_deref())
         .unwrap_or("default");
+    let fast = if session.service_tier.as_deref() == Some("fast") {
+        "on"
+    } else {
+        "off"
+    };
     let approval = runtime
         .as_ref()
         .and_then(|value| value.approval_policy.as_deref())
@@ -845,7 +850,7 @@ pub(super) fn format_session_status(
     };
 
     format!(
-        "**Current Telegram session:** {telegram_title}\n- codex session title: {codex_title}\n- state: `{state}`\n- cwd: `{}`\n- codex thread: `{}`\n- model: `{model}`\n- reasoning: `{reasoning}`\n- approval: `{}`\n- sandbox: `{}`\n- search: `{}`\n- prompt: `{prompt}`",
+        "**Current Telegram session:** {telegram_title}\n- codex session title: {codex_title}\n- state: `{state}`\n- cwd: `{}`\n- codex thread: `{}`\n- model: `{model}`\n- reasoning: `{reasoning}`\n- fast: `{fast}`\n- approval: `{}`\n- sandbox: `{}`\n- search: `{}`\n- prompt: `{prompt}`",
         session.cwd.display(),
         codex_thread,
         approval,
