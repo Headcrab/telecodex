@@ -52,8 +52,8 @@ use crate::{
     store::{INSTANCE_LOCK_LOST_ERROR, SessionDefaults, Store},
     telegram::{
         ChatAction, EditMessageText, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-        SendMessage, TelegramClient, TelegramError, is_foreign_bot_command, normalize_command,
-        preferred_image_file_id,
+        SendMessage, SendMessageDraft, TelegramClient, TelegramError, is_foreign_bot_command,
+        normalize_command, preferred_image_file_id,
     },
     transcribe::{detect_handy_parakeet_model_dir, transcribe_audio_file},
 };
