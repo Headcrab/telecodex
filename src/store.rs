@@ -5,16 +5,20 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
 
 use crate::{
     config::{CodexConfig, SearchMode},
-    models::{SessionKey, SessionRecord, TurnRequest, UserRecord, UserRole},
+    models::{ReviewRequest, SessionKey, SessionRecord, TurnRequest, UserRecord, UserRole},
 };
+
+pub const INSTANCE_LOCK_LOST_ERROR: &str = "Telecodex database instance lock was lost";
 
 pub struct Store {
     conn: Mutex<Connection>,
+    instance_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -50,16 +54,32 @@ impl Store {
             .with_context(|| format!("failed to open sqlite database {}", db_path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        let instance_id = Uuid::now_v7().to_string();
         let store = Self {
             conn: Mutex::new(conn),
+            instance_id,
         };
         store.init_schema()?;
+        let stale_cutoff = stale_instance_cutoff();
+        store.claim_instance_lock(&stale_cutoff)?;
+        let recovered = store.recover_interrupted_turns(&stale_cutoff)?;
         store.seed_admins(admin_ids)?;
         store.audit(
             None,
             "startup",
-            serde_json::json!({ "admins_seeded": admin_ids }),
+            serde_json::json!({
+                "admins_seeded": admin_ids,
+                "interrupted_turns_recovered": recovered.interrupted_turns,
+                "busy_sessions_recovered": recovered.busy_sessions,
+            }),
         )?;
+        if recovered.interrupted_turns > 0 || recovered.busy_sessions > 0 {
+            tracing::warn!(
+                "recovered {} interrupted turns and {} busy sessions from a previous process",
+                recovered.interrupted_turns,
+                recovered.busy_sessions
+            );
+        }
         if admin_ids.is_empty() {
             tracing::warn!(
                 "startup_admin_ids is empty; the bot will deny everyone until an admin is inserted manually"
@@ -69,6 +89,81 @@ impl Store {
             return Err(anyhow!("default cwd is empty"));
         }
         Ok(store)
+    }
+
+    fn claim_instance_lock(&self, stale_cutoff: &str) -> Result<()> {
+        let now = now_string();
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "INSERT INTO app_instance_lock(key, instance_id, heartbeat_at, acquired_at)
+             VALUES ('main', ?1, ?2, ?2)
+             ON CONFLICT(key) DO UPDATE
+             SET instance_id = excluded.instance_id,
+                 heartbeat_at = excluded.heartbeat_at,
+                 acquired_at = excluded.acquired_at
+             WHERE app_instance_lock.instance_id = excluded.instance_id
+                OR app_instance_lock.heartbeat_at < ?3",
+            params![self.instance_id, now, stale_cutoff],
+        )?;
+        if changed != 0 {
+            return Ok(());
+        }
+
+        let holder = conn
+            .query_row(
+                "SELECT instance_id, heartbeat_at FROM app_instance_lock WHERE key = 'main'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((holder_id, heartbeat_at)) = holder else {
+            return Err(anyhow!("failed to claim Telecodex database instance lock"));
+        };
+        Err(anyhow!(
+            "Telecodex database is already owned by live instance {holder_id} with heartbeat {heartbeat_at}"
+        ))
+    }
+
+    pub fn heartbeat_instance(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE app_instance_lock
+             SET heartbeat_at = ?2
+             WHERE key = 'main' AND instance_id = ?1",
+            params![self.instance_id, now_string()],
+        )?;
+        if changed == 0 {
+            return Err(anyhow!(INSTANCE_LOCK_LOST_ERROR));
+        }
+        Ok(())
+    }
+
+    pub fn release_instance_lock(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        release_instance_lock_for(&conn, &self.instance_id)
+    }
+
+    fn recover_interrupted_turns(&self, stale_cutoff: &str) -> Result<InterruptedTurnRecovery> {
+        let now = now_string();
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let interrupted_turns = conn.execute(
+            "UPDATE turns
+             SET status = 'failed',
+                 assistant_text = COALESCE(assistant_text, 'Telecodex restarted before this turn completed. Retry the request if it still matters.'),
+                 completed_at = ?1
+             WHERE status = 'running' AND started_at < ?2",
+            params![now, stale_cutoff],
+        )?;
+        let busy_sessions = conn.execute(
+            "UPDATE sessions
+             SET busy = 0, updated_at = ?1
+             WHERE busy != 0 AND updated_at < ?2",
+            params![now, stale_cutoff],
+        )?;
+        Ok(InterruptedTurnRecovery {
+            interrupted_turns,
+            busy_sessions,
+        })
     }
 
     pub fn last_update_id(&self) -> Result<Option<i64>> {
@@ -196,7 +291,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.query_row(
             "SELECT id, chat_id, thread_id, session_title, codex_thread_id, force_fresh_thread, cwd, model, reasoning_effort, session_prompt, sandbox_mode, approval_policy,
-                    search_mode, add_dirs_json, creator_user_id, busy, last_assistant_text, updated_at
+                    search_mode, add_dirs_json, creator_user_id, busy, last_assistant_text, updated_at, service_tier
              FROM sessions
              WHERE chat_id = ?1 AND thread_id = ?2",
             params![key.chat_id, key.thread_id],
@@ -210,7 +305,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, thread_id, session_title, codex_thread_id, force_fresh_thread, cwd, model, reasoning_effort, session_prompt, sandbox_mode, approval_policy,
-                    search_mode, add_dirs_json, creator_user_id, busy, last_assistant_text, updated_at
+                    search_mode, add_dirs_json, creator_user_id, busy, last_assistant_text, updated_at, service_tier
              FROM sessions
              WHERE chat_id = ?1
              ORDER BY updated_at DESC, id DESC",
@@ -269,7 +364,8 @@ impl Store {
                  approval_policy = ?11,
                  search_mode = ?12,
                  add_dirs_json = ?13,
-                 updated_at = ?14
+                 service_tier = ?14,
+                 updated_at = ?15
              WHERE chat_id = ?1 AND thread_id = ?2",
             params![
                 key.chat_id,
@@ -285,6 +381,7 @@ impl Store {
                 template.approval_policy,
                 template.search_mode.as_codex_value(),
                 add_dirs,
+                template.service_tier.as_deref(),
                 now_string(),
             ],
         )
@@ -330,6 +427,18 @@ impl Store {
             key,
             "UPDATE sessions SET reasoning_effort = ?3, updated_at = ?4 WHERE chat_id = ?1 AND thread_id = ?2",
             params![key.chat_id, key.thread_id, reasoning_effort, now_string()],
+        )
+    }
+
+    pub fn set_session_service_tier(
+        &self,
+        key: SessionKey,
+        service_tier: Option<&str>,
+    ) -> Result<()> {
+        self.update_session_field(
+            key,
+            "UPDATE sessions SET service_tier = ?3, updated_at = ?4 WHERE chat_id = ?1 AND thread_id = ?2",
+            params![key.chat_id, key.thread_id, service_tier, now_string()],
         )
     }
 
@@ -410,6 +519,51 @@ impl Store {
         Ok(())
     }
 
+    pub fn retry_request_for_turn(
+        &self,
+        turn_id: i64,
+        session_key: SessionKey,
+        from_user_id: i64,
+    ) -> Result<Option<TurnRequest>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT t.prompt, t.review_json, t.status
+                 FROM turns t
+                 JOIN sessions s ON s.id = t.session_id
+                 WHERE t.id = ?1 AND s.chat_id = ?2 AND s.thread_id = ?3",
+                params![turn_id, session_key.chat_id, session_key.thread_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((prompt, review_json, status)) = row else {
+            return Ok(None);
+        };
+        if !matches!(status.as_str(), "failed" | "cancelled") {
+            return Ok(None);
+        }
+        let review_mode: Option<ReviewRequest> = match review_json {
+            Some(review_json) => serde_json::from_str(&review_json)
+                .with_context(|| format!("failed to parse review request for turn {turn_id}"))?,
+            None => None,
+        };
+        Ok(Some(TurnRequest {
+            session_key,
+            from_user_id,
+            prompt,
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode,
+            override_search_mode: None,
+        }))
+    }
+
     pub fn set_last_assistant_text(&self, key: SessionKey, text: Option<&str>) -> Result<()> {
         self.update_session_field(
             key,
@@ -467,6 +621,7 @@ impl Store {
                 cwd TEXT NOT NULL,
                 model TEXT,
                 reasoning_effort TEXT,
+                service_tier TEXT,
                 session_prompt TEXT,
                 sandbox_mode TEXT NOT NULL,
                 approval_policy TEXT NOT NULL,
@@ -505,10 +660,18 @@ impl Store {
                 details_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS app_instance_lock(
+                key TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                acquired_at TEXT NOT NULL
+            );
             ",
         )?;
         add_column_if_missing(&conn, "sessions", "session_title", "TEXT")?;
         add_column_if_missing(&conn, "sessions", "reasoning_effort", "TEXT")?;
+        add_column_if_missing(&conn, "sessions", "service_tier", "TEXT")?;
         add_column_if_missing(&conn, "sessions", "session_prompt", "TEXT")?;
         add_column_if_missing(
             &conn,
@@ -555,6 +718,20 @@ impl Store {
     }
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Ok(conn) = self.conn.get_mut() {
+            let _ = release_instance_lock_for(conn, &self.instance_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InterruptedTurnRecovery {
+    interrupted_turns: usize,
+    busy_sessions: usize,
+}
+
 fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let add_dirs_json: String = row.get(13)?;
     let add_dirs_strings: Vec<String> = serde_json::from_str(&add_dirs_json).map_err(|error| {
@@ -574,6 +751,7 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         cwd: normalize_path(PathBuf::from(row.get::<_, String>(6)?)),
         model: row.get(7)?,
         reasoning_effort: row.get(8)?,
+        service_tier: row.get(18)?,
         session_prompt: row.get(9)?,
         sandbox_mode: row.get(10)?,
         approval_policy: row.get(11)?,
@@ -615,6 +793,23 @@ fn add_column_if_missing(
 
 fn now_string() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn release_instance_lock_for(conn: &Connection, instance_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM app_instance_lock WHERE key = 'main' AND instance_id = ?1",
+        params![instance_id],
+    )?;
+    Ok(())
+}
+
+fn stale_instance_cutoff() -> String {
+    let seconds = std::env::var("TELECODEX_INSTANCE_STALE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(120);
+    (Utc::now() - Duration::seconds(seconds)).to_rfc3339()
 }
 
 fn bool_to_i64(value: bool) -> i64 {
@@ -662,6 +857,21 @@ mod tests {
         }
     }
 
+    fn mark_turn_and_session_stale(db_path: &std::path::Path, turn_id: i64, key: SessionKey) {
+        let stale = (Utc::now() - Duration::seconds(300)).to_rfc3339();
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE turns SET started_at = ?1 WHERE id = ?2",
+            rusqlite::params![stale, turn_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE chat_id = ?2 AND thread_id = ?3",
+            rusqlite::params![stale, key.chat_id, key.thread_id],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn seeds_admins_and_sessions() {
         let tmp = NamedTempFile::new().unwrap();
@@ -704,5 +914,149 @@ mod tests {
             .unwrap();
         let last = store.last_assistant_text(session.key).unwrap();
         assert!(last.is_none());
+    }
+
+    #[test]
+    fn recovers_interrupted_turns_on_startup() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store
+            .ensure_session(SessionKey::new(1, Some(10)), 100, &defaults())
+            .unwrap();
+        let request = TurnRequest {
+            session_key: session.key,
+            from_user_id: 100,
+            prompt: "hello".to_string(),
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode: None,
+            override_search_mode: None,
+        };
+        let turn_id = store.record_turn_started(session.id, &request).unwrap();
+        store.set_session_busy(session.key, true).unwrap();
+        drop(store);
+        mark_turn_and_session_stale(tmp.path(), turn_id, session.key);
+
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store.get_session(session.key).unwrap().unwrap();
+
+        assert!(!session.busy);
+        assert_eq!(
+            store.turn_status(turn_id).unwrap().as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn keeps_fresh_running_turns_on_startup() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store
+            .ensure_session(SessionKey::new(1, Some(10)), 100, &defaults())
+            .unwrap();
+        let request = TurnRequest {
+            session_key: session.key,
+            from_user_id: 100,
+            prompt: "hello".to_string(),
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode: None,
+            override_search_mode: None,
+        };
+        let turn_id = store.record_turn_started(session.id, &request).unwrap();
+        store.set_session_busy(session.key, true).unwrap();
+        drop(store);
+
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store.get_session(session.key).unwrap().unwrap();
+
+        assert!(session.busy);
+        assert_eq!(
+            store.turn_status(turn_id).unwrap().as_deref(),
+            Some("running")
+        );
+    }
+
+    #[test]
+    fn refuses_second_live_instance() {
+        let tmp = NamedTempFile::new().unwrap();
+        let _store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let second = Store::open(tmp.path(), &[100], &defaults());
+
+        assert!(second.is_err());
+        assert!(format!("{:#}", second.err().unwrap()).contains("already owned by live instance"));
+    }
+
+    #[test]
+    fn builds_retry_request_for_failed_turn() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store
+            .ensure_session(SessionKey::new(1, Some(10)), 100, &defaults())
+            .unwrap();
+        let request = TurnRequest {
+            session_key: session.key,
+            from_user_id: 100,
+            prompt: "hello".to_string(),
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode: Some(ReviewRequest {
+                base: Some("main".to_string()),
+                commit: None,
+                uncommitted: false,
+                title: None,
+                prompt: Some("review this".to_string()),
+            }),
+            override_search_mode: None,
+        };
+        let turn_id = store.record_turn_started(session.id, &request).unwrap();
+        store.record_turn_finished(turn_id, "failed", None).unwrap();
+
+        let retry = store
+            .retry_request_for_turn(turn_id, session.key, 200)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(retry.from_user_id, 200);
+        assert_eq!(retry.prompt, "hello");
+        assert!(retry.attachments.is_empty());
+        assert_eq!(retry.review_mode.unwrap().base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn builds_retry_request_for_failed_turn_with_null_review_json() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store
+            .ensure_session(SessionKey::new(1, Some(10)), 100, &defaults())
+            .unwrap();
+        let request = TurnRequest {
+            session_key: session.key,
+            from_user_id: 100,
+            prompt: "hello".to_string(),
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode: None,
+            override_search_mode: None,
+        };
+        let turn_id = store.record_turn_started(session.id, &request).unwrap();
+        store.record_turn_finished(turn_id, "failed", None).unwrap();
+        {
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "UPDATE turns SET review_json = NULL WHERE id = ?1",
+                rusqlite::params![turn_id],
+            )
+            .unwrap();
+        }
+
+        let retry = store
+            .retry_request_for_turn(turn_id, session.key, 200)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(retry.from_user_id, 200);
+        assert_eq!(retry.prompt, "hello");
+        assert!(retry.review_mode.is_none());
     }
 }

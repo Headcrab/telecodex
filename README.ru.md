@@ -57,8 +57,9 @@
 
 - Поллит Telegram Bot API через `getUpdates`.
 - Держит одну логическую сессию на пару chat/topic.
-- Ставит ходы в очередь по сессии и стримит прогресс через редактирование сообщений.
-- Поддерживает `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop` и настройки рантайма на уровне сессии.
+- Ставит ходы в очередь по сессии и стримит прогресс через drafts в приватных чатах или редактирование Telegram-сообщений.
+- Ставит исходящие Telegram-доставки в очередь по chat_id, использует более безопасный темп для групп/topic'ов и делает backoff при Telegram `retry_after`.
+- Поддерживает `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, `/retry`, `/fast` и настройки рантайма на уровне сессии.
 - Может привязать Telegram topic к существующему Codex thread по id или `latest`.
 - В primary forum dashboard окружения показываются для импорта, а topic создаётся по нажатию кнопки по умолчанию.
 
@@ -121,7 +122,7 @@ Telegram chat/topic
 2. Telecodex определяет активную сессию для текущего чата/topic.
 3. Текст и вложения превращаются в запрос на ход для Codex.
 4. Codex выполняется локально в настроенном workspace.
-5. Прогресс стримится обратно через редактирование Telegram-сообщений.
+5. Прогресс стримится обратно через drafts в приватных чатах или редактирование Telegram-сообщений.
 6. Файлы из выходной директории хода отправляются пользователю.
 
 ## 🛠️ Модель команд
@@ -143,8 +144,10 @@ Telegram chat/topic
 | `/history` | Листать итоговые сообщения ассистента из выбранной Codex-сессии через интерактивный pager |
 | `/status` | Показать текущую Telegram-сессию, выбранную Codex-сессию и runtime-настройки |
 | `/stop` | Остановить активный ход |
+| `/retry <turn_id>` | Повторить failed или cancelled ход без вложений |
 | `/model [model\|default\|-]` | Поставить или показать модель |
 | `/think [minimal\|low\|medium\|high\|default\|-]` | Поставить или показать reasoning effort |
+| `/fast [on\|off\|status]` | Поставить или показать fast mode для этой сессии |
 | `/prompt [text\|clear\|default\|-]` | Поставить или очистить постоянный session prompt |
 | `/approval <never\|on-request\|untrusted>` | Поставить approval policy |
 | `/sandbox <read-only\|workspace-write\|danger-full-access>` | Поставить sandbox mode |
@@ -258,7 +261,8 @@ Telecodex запустит `codex login --device-auth`, пришлёт клик�
 ### Telegram
 
 - `telegram.bot_token` или `telegram.bot_token_env` должны быть заданы.
-- `telegram.use_message_drafts = true` включает draft-подобные превью в приватных чатах.
+- `telegram.use_message_drafts = true` включает превью через `sendMessageDraft` в приватных чатах; финальный ответ всё равно отправляется обычным сообщением.
+- В группах и topic'ах превью обновляются через `editMessageText` с ограничением частоты, а исходящие Telegram-доставки ограничиваются по chat_id, чтобы не упираться в лимиты Bot API.
 - `telegram.primary_forum_chat_id` используется командой `/topic`, чтобы создавать topic'и в одном выделенном форуме.
 - `telegram.auto_create_topics = false` оставляет импорт окружений ручным; поставь `true`, если хочешь автосоздание недостающих topic'ов из истории.
 - `telegram.forum_sync_topics_per_poll` ограничивает интенсивность topic sync.

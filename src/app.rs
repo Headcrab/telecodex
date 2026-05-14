@@ -37,7 +37,8 @@ use crate::{
         list_threads_for_cwd, read_thread_history,
     },
     commands::{
-        BridgeCommand, CommandHelp, ParsedInput, command_help, default_bot_commands, parse_command,
+        BridgeCommand, CommandHelp, FastMode, ParsedInput, command_help, default_bot_commands,
+        parse_command,
     },
     config::Config,
     limits::{
@@ -48,11 +49,11 @@ use crate::{
         AttachmentKind, LocalAttachment, SessionKey, TelegramMessageRef, TurnRequest, UserRole,
     },
     render::{render_markdown_to_html, split_text},
-    store::{SessionDefaults, Store},
+    store::{INSTANCE_LOCK_LOST_ERROR, SessionDefaults, Store},
     telegram::{
         ChatAction, EditMessageText, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-        SendMessage, TelegramClient, TelegramError, is_foreign_bot_command, normalize_command,
-        preferred_image_file_id,
+        SendMessage, SendMessageDraft, TelegramClient, TelegramError, is_foreign_bot_command,
+        normalize_command, preferred_image_file_id,
     },
     transcribe::{detect_handy_parakeet_model_dir, transcribe_audio_file},
 };
@@ -79,6 +80,7 @@ struct AppShared {
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
     pending_codex_login: Mutex<Option<PendingCodexLogin>>,
     codex_login_backoff_until: Mutex<Option<Instant>>,
+    shutdown: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -220,6 +222,7 @@ impl App {
                 pending_approvals: Mutex::new(HashMap::new()),
                 pending_codex_login: Mutex::new(None),
                 codex_login_backoff_until: Mutex::new(None),
+                shutdown: CancellationToken::new(),
             }),
             workers: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -235,6 +238,11 @@ impl App {
         self.notify_primary_user(&format!("🟢 Telecodex {} started", app_version_label()))
             .await;
 
+        let heartbeat_app = self.clone();
+        tokio::spawn(async move {
+            heartbeat_app.run_instance_heartbeat_loop().await;
+        });
+
         let maintenance_app = self.clone();
         tokio::spawn(async move {
             if let Err(error) = maintenance_app.run_background_maintenance_loop().await {
@@ -244,10 +252,12 @@ impl App {
 
         let mut offset = self.shared.store.last_update_id()?.map(|value| value + 1);
         tracing::info!("telecodex started {}", app_version_label());
+        let shutdown = shutdown_signal(self.shared.shutdown.clone());
+        tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                _ = &mut shutdown => {
                     tracing::info!("shutdown signal received");
                     self.notify_primary_user(&format!("🔴 Telecodex {} stopped", app_version_label()))
                         .await;
@@ -284,6 +294,22 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    async fn run_instance_heartbeat_loop(&self) {
+        loop {
+            sleep(Duration::from_secs(
+                (Self::BACKGROUND_MAINTENANCE_INTERVAL_SECONDS / 2).max(1),
+            ))
+            .await;
+            if let Err(error) = self.shared.store.heartbeat_instance() {
+                tracing::error!("database instance heartbeat failed: {error:#}");
+                if error.to_string() == INSTANCE_LOCK_LOST_ERROR {
+                    self.shared.shutdown.cancel();
+                    return;
                 }
             }
         }
@@ -891,6 +917,26 @@ impl App {
                         .await?;
                     }
                 }
+                BridgeCommand::RetryTurn { turn_id } => {
+                    let Some(mut request) = self.shared.store.retry_request_for_turn(
+                        turn_id,
+                        session_key,
+                        user.tg_user_id,
+                    )?
+                    else {
+                        self.send_status(
+                            message.chat.id,
+                            message.message_thread_id,
+                            &format!("Turn `{turn_id}` is not retryable in this session."),
+                        )
+                        .await?;
+                        return Ok(());
+                    };
+                    if request.review_mode.is_none() {
+                        request.override_search_mode = auto_search_mode_for_prompt(&request.prompt);
+                    }
+                    self.enqueue_turn(request, &message.chat.kind).await?;
+                }
                 BridgeCommand::Allow { user_id } => {
                     ensure_admin(user)?;
                     let role = self
@@ -1059,6 +1105,54 @@ impl App {
                             },
                         )
                         .await?;
+                    }
+                }
+                BridgeCommand::Fast { mode } => {
+                    let session = self.ensure_session(session_key, user.tg_user_id)?;
+                    match mode {
+                        FastMode::Status => {
+                            let label = if session.service_tier.as_deref() == Some("fast") {
+                                "on"
+                            } else {
+                                "off"
+                            };
+                            self.send_command_help(
+                                message.chat.id,
+                                message.message_thread_id,
+                                &CommandHelp {
+                                    text: format!(
+                                        "Fast mode is `{label}` for this session.\n\nFast mode asks Codex to use faster inference with increased plan usage."
+                                    ),
+                                    quick_commands: vec![vec![
+                                        "/fast on".to_string(),
+                                        "/fast off".to_string(),
+                                    ]],
+                                },
+                            )
+                            .await?;
+                        }
+                        FastMode::On => {
+                            self.shared
+                                .store
+                                .set_session_service_tier(session_key, Some("fast"))?;
+                            self.send_status(
+                                message.chat.id,
+                                message.message_thread_id,
+                                "⚡ Fast mode enabled for this session. Disable with `/fast off`.",
+                            )
+                            .await?;
+                        }
+                        FastMode::Off => {
+                            self.shared
+                                .store
+                                .set_session_service_tier(session_key, None)?;
+                            self.send_status(
+                                message.chat.id,
+                                message.message_thread_id,
+                                "Fast mode disabled for this session.",
+                            )
+                            .await?;
+                        }
                     }
                 }
                 BridgeCommand::Prompt { prompt } => {
@@ -1237,8 +1331,14 @@ impl App {
                         app_version_label()
                     ))
                     .await;
+                    let shared = self.shared.clone();
                     tokio::spawn(async move {
                         sleep(Duration::from_millis(750)).await;
+                        if let Err(error) = shared.store.release_instance_lock() {
+                            tracing::warn!(
+                                "failed to release database instance lock before restart: {error:#}"
+                            );
+                        }
                         std::process::exit(0);
                     });
                 }
@@ -1630,6 +1730,27 @@ impl App {
             Duration::from_secs(Self::HISTORY_PAGE_CACHE_TTL_SECONDS),
             Self::HISTORY_PAGE_CACHE_MAX_ENTRIES,
         );
+    }
+}
+
+async fn shutdown_signal(shutdown: CancellationToken) {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+            _ = shutdown.cancelled() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = shutdown.cancelled() => {}
+        }
     }
 }
 

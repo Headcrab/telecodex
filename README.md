@@ -57,8 +57,9 @@ No webhook infrastructure. No browser dependency. No cloud relay between Telegra
 
 - Polls Telegram Bot API via `getUpdates`.
 - Maintains one logical session per Telegram chat/topic pair.
-- Queues turns per session and streams progress by editing Telegram messages in place.
-- Supports `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, and per-session runtime settings.
+- Queues turns per session and streams progress with private chat drafts or in-place Telegram message edits.
+- Queues outbound Telegram deliveries per chat, applies a safer group/topic send cadence, and backs off when Telegram returns `retry_after`.
+- Supports `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, `/retry`, `/fast`, and per-session runtime settings.
 - Can bind a Telegram topic to an existing Codex thread by thread id or `latest`.
 - In the primary forum dashboard, environments are listed for import and topics are created on button click by default.
 
@@ -121,7 +122,7 @@ High-level flow:
 2. Telecodex resolves the active session for the current chat/topic.
 3. Incoming text and attachments are converted into a Codex turn request.
 4. Codex runs locally in the configured workspace.
-5. Progress is streamed back by editing Telegram messages.
+5. Progress is streamed back with private chat drafts or Telegram message edits.
 6. Files produced in the turn output directory are uploaded back to Telegram.
 
 ## 🛠️ Command model
@@ -143,8 +144,10 @@ High-level flow:
 | `/history` | Browse final assistant messages from the selected Codex session with an interactive pager |
 | `/status` | Show the current Telegram session, selected Codex session, and runtime settings |
 | `/stop` | Stop the active turn |
+| `/retry <turn_id>` | Retry a failed or cancelled turn without attachments |
 | `/model [model\|default\|-]` | Set or show the current model |
 | `/think [minimal\|low\|medium\|high\|default\|-]` | Set or show reasoning effort |
+| `/fast [on\|off\|status]` | Set or show fast mode for this session |
 | `/prompt [text\|clear\|default\|-]` | Set or clear the persistent session prompt |
 | `/approval <never\|on-request\|untrusted>` | Set approval policy |
 | `/sandbox <read-only\|workspace-write\|danger-full-access>` | Set sandbox mode |
@@ -259,7 +262,8 @@ Telecodex will start `codex login --device-auth`, send a clickable `auth.openai.
 ### Telegram
 
 - `telegram.bot_token` or `telegram.bot_token_env` must be configured.
-- `telegram.use_message_drafts = true` enables draft-style previews for private chats.
+- `telegram.use_message_drafts = true` enables `sendMessageDraft` previews for private chats; final replies are still sent as normal messages.
+- Group and topic previews use throttled `editMessageText` updates, and outbound Telegram deliveries are paced per chat to avoid Bot API rate limits.
 - `telegram.primary_forum_chat_id` is used by `/topic` to create topics in one dedicated forum.
 - `telegram.auto_create_topics = false` keeps environment import manual; set it to `true` to auto-create missing forum topics from history.
 - `telegram.forum_sync_topics_per_poll` throttles topic sync work.

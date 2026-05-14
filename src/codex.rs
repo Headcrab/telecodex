@@ -694,6 +694,7 @@ fn build_review_command(
         &session.approval_policy,
         &session.model,
         session.reasoning_effort.as_deref(),
+        session.service_tier.as_deref(),
         developer_instructions.as_deref(),
     );
     if review.uncommitted {
@@ -755,7 +756,12 @@ fn build_turn_start_params(
     for image in request.image_paths() {
         input.push(json!({"type":"localImage","path":sanitize_arg_path(&image)}));
     }
-    json!({"threadId":thread_id,"input":input,"cwd":sanitize_arg_path(&session.cwd),"approvalPolicy":session.approval_policy,"sandboxPolicy":build_sandbox_policy(session),"model":session.model,"effort":session.reasoning_effort,"summary":Value::Null,"serviceTier":Value::Null,"outputSchema":Value::Null,"personality":Value::Null,"collaborationMode":Value::Null,"config":build_config_overrides(effective_search_mode)})
+    let service_tier = session
+        .service_tier
+        .as_deref()
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    json!({"threadId":thread_id,"input":input,"cwd":sanitize_arg_path(&session.cwd),"approvalPolicy":session.approval_policy,"sandboxPolicy":build_sandbox_policy(session),"model":session.model,"effort":session.reasoning_effort,"summary":Value::Null,"serviceTier":service_tier,"outputSchema":Value::Null,"personality":Value::Null,"collaborationMode":Value::Null,"config":build_config_overrides(effective_search_mode)})
 }
 
 fn build_sandbox_policy(session: &SessionRecord) -> Value {
@@ -1096,6 +1102,7 @@ fn push_common_config_args(
     approval_policy: &str,
     model: &Option<String>,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     developer_instructions: Option<&str>,
 ) {
     args.push("-c".to_string());
@@ -1105,6 +1112,13 @@ fn push_common_config_args(
     if let Some(reasoning_effort) = reasoning_effort {
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort={reasoning_effort}"));
+    }
+    if let Some(service_tier) = service_tier {
+        args.push("-c".to_string());
+        args.push(format!(
+            "service_tier={}",
+            toml::Value::String(service_tier.to_string())
+        ));
     }
     if let Some(developer_instructions) = developer_instructions {
         args.push("-c".to_string());
@@ -1449,6 +1463,7 @@ mod tests {
             cwd: sample_workspace(),
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: None,
+            service_tier: None,
             session_prompt: None,
             sandbox_mode: mode.to_string(),
             approval_policy: "never".to_string(),
@@ -1554,6 +1569,34 @@ mod tests {
 
         assert_eq!(spec.current_dir.as_deref(), Some(session.cwd.as_path()));
         assert!(spec.args.contains(&"review".to_string()));
+    }
+
+    #[test]
+    fn build_review_command_uses_fast_service_tier() {
+        let mut session = session_with_sandbox("workspace-write");
+        session.service_tier = Some("fast".to_string());
+        let request = review_request();
+        let spec = build_review_command(
+            Path::new("codex"),
+            &session,
+            &request,
+            request.review_mode.as_ref().unwrap(),
+        );
+
+        assert!(spec.args.contains(&"service_tier=\"fast\"".to_string()));
+    }
+
+    #[test]
+    fn build_turn_start_params_uses_fast_service_tier() {
+        let mut session = session_with_sandbox("workspace-write");
+        session.service_tier = Some("fast".to_string());
+        let request = review_request();
+        let params = build_turn_start_params("thread-1", &session, &request);
+
+        assert_eq!(
+            params.get("serviceTier").and_then(Value::as_str),
+            Some("fast")
+        );
     }
 
     #[test]

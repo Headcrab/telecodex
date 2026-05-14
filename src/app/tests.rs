@@ -136,6 +136,17 @@ fn formats_turn_completion_notification() {
 }
 
 #[test]
+fn builds_rate_limit_retry_keyboard() {
+    let keyboard = rate_limit_retry_keyboard(42);
+
+    assert_eq!(keyboard.inline_keyboard[0][0].text, "Retry");
+    assert_eq!(
+        keyboard.inline_keyboard[0][0].callback_data.as_deref(),
+        Some("cmd:/retry 42")
+    );
+}
+
+#[test]
 fn detects_stale_codex_thread_errors_in_error_context() {
     let error = anyhow::anyhow!("codex turn failed")
         .context("no rollout found for thread id 019abc | code -32600");
@@ -192,6 +203,7 @@ fn hides_sessions_overview_body_when_keyboard_is_available() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -224,6 +236,7 @@ fn builds_clickable_chat_sessions_keyboard() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -260,6 +273,7 @@ fn builds_topic_links_for_dashboard_root_sessions_keyboard() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -277,6 +291,7 @@ fn builds_topic_links_for_dashboard_root_sessions_keyboard() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -320,6 +335,7 @@ fn session_environment_match_requires_same_title_and_cwd() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -357,6 +373,7 @@ fn forum_sync_preserves_manual_codex_binding() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -389,6 +406,7 @@ fn forum_sync_seeds_unbound_environment_session() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -421,6 +439,7 @@ fn forum_sync_preserves_fresh_thread_request() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -453,6 +472,7 @@ fn format_session_status_marks_unbound_codex_session() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -487,6 +507,7 @@ fn format_session_status_marks_fresh_codex_session() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -664,6 +685,7 @@ fn history_callback_matches_only_current_session_binding() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -694,6 +716,7 @@ fn history_callback_rejects_unbound_fresh_session() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -720,6 +743,7 @@ fn formats_stale_history_page_for_rebound_topic() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -747,6 +771,7 @@ fn builds_import_button_for_seed_environment() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -876,6 +901,7 @@ fn builds_clickable_codex_sessions_keyboard() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -1046,6 +1072,7 @@ fn keeps_audio_transcript_in_user_prompt_only() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -1104,6 +1131,7 @@ fn keeps_non_transcribed_audio_paths_in_user_prompt() {
         cwd: sample_workspace(),
         model: None,
         reasoning_effort: None,
+        service_tier: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -1442,6 +1470,7 @@ fn rebinds_stale_session_to_latest_active_thread_for_same_cwd() {
         pending_approvals: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
+        shutdown: CancellationToken::new(),
     });
     let session = shared
         .store
@@ -1503,6 +1532,7 @@ fn keeps_truly_archived_session_unbound_when_no_active_replacement_exists() {
         pending_approvals: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
+        shutdown: CancellationToken::new(),
     });
     let session = shared
         .store

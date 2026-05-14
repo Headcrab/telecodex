@@ -1,22 +1,33 @@
-use std::time::Duration;
-use std::{error::Error, fmt};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
     token: String,
     api_base: String,
+    outbound: Arc<OutboundRateLimiter>,
 }
 
 const TELEGRAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TELEGRAM_GET_UPDATES_GRACE: Duration = Duration::from_secs(15);
 const TELEGRAM_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const TELEGRAM_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+pub const TELEGRAM_GROUP_OUTBOUND_INTERVAL_MS: u64 = 3_500;
+pub const TELEGRAM_PRIVATE_OUTBOUND_INTERVAL_MS: u64 = 1_000;
+const TELEGRAM_GLOBAL_OUTBOUND_INTERVAL_MS: u64 = 40;
 
 impl TelegramClient {
     pub fn new(token: String, api_base: String) -> Self {
@@ -24,6 +35,7 @@ impl TelegramClient {
             http: reqwest::Client::new(),
             token,
             api_base: api_base.trim_end_matches('/').to_string(),
+            outbound: Arc::new(OutboundRateLimiter::default()),
         }
     }
 
@@ -64,7 +76,9 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, request: SendMessage) -> Result<Message> {
-        self.post("sendMessage", Some(&request)).await
+        let chat_id = request.chat_id;
+        self.post_outbound(chat_id, "sendMessage", Some(&request))
+            .await
     }
 
     pub async fn send_chat_action(
@@ -92,7 +106,9 @@ impl TelegramClient {
     }
 
     pub async fn edit_message_text(&self, request: EditMessageText) -> Result<Message> {
-        self.post("editMessageText", Some(&request)).await
+        let chat_id = request.chat_id;
+        self.post_outbound(chat_id, "editMessageText", Some(&request))
+            .await
     }
 
     pub async fn answer_callback_query(&self, callback_query_id: &str) -> Result<bool> {
@@ -192,8 +208,12 @@ impl TelegramClient {
             name: &'a str,
         }
 
-        self.post("createForumTopic", Some(&Payload { chat_id, name }))
-            .await
+        self.post_outbound(
+            chat_id,
+            "createForumTopic",
+            Some(&Payload { chat_id, name }),
+        )
+        .await
     }
 
     pub async fn close_forum_topic(&self, chat_id: i64, message_thread_id: i64) -> Result<bool> {
@@ -203,7 +223,8 @@ impl TelegramClient {
             message_thread_id: i64,
         }
 
-        self.post(
+        self.post_outbound(
+            chat_id,
             "closeForumTopic",
             Some(&Payload {
                 chat_id,
@@ -220,7 +241,8 @@ impl TelegramClient {
             message_thread_id: i64,
         }
 
-        self.post(
+        self.post_outbound(
+            chat_id,
             "deleteForumTopic",
             Some(&Payload {
                 chat_id,
@@ -243,7 +265,8 @@ impl TelegramClient {
             name: &'a str,
         }
 
-        self.post(
+        self.post_outbound(
+            chat_id,
             "editForumTopic",
             Some(&Payload {
                 chat_id,
@@ -254,28 +277,10 @@ impl TelegramClient {
         .await
     }
 
-    pub async fn send_message_draft(
-        &self,
-        chat_id: i64,
-        message_thread_id: Option<i64>,
-        text: &str,
-    ) -> Result<bool> {
-        #[derive(Serialize)]
-        struct Payload<'a> {
-            chat_id: i64,
-            message_thread_id: Option<i64>,
-            text: &'a str,
-        }
-
-        self.post(
-            "sendMessageDraft",
-            Some(&Payload {
-                chat_id,
-                message_thread_id,
-                text,
-            }),
-        )
-        .await
+    pub async fn send_message_draft(&self, request: SendMessageDraft) -> Result<bool> {
+        let chat_id = request.chat_id;
+        self.post_outbound(chat_id, "sendMessageDraft", Some(&request))
+            .await
     }
 
     pub async fn get_file(&self, file_id: &str) -> Result<File> {
@@ -310,6 +315,24 @@ impl TelegramClient {
     {
         self.post_with_timeout(method, payload, TELEGRAM_REQUEST_TIMEOUT)
             .await
+    }
+
+    async fn post_outbound<T, R>(
+        &self,
+        chat_id: i64,
+        method: &str,
+        payload: Option<&T>,
+    ) -> Result<R>
+    where
+        T: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        self.outbound.wait(chat_id).await;
+        let result = self.post(method, payload).await;
+        if let Err(error) = &result {
+            self.outbound.note_retry_after(chat_id, error).await;
+        }
+        result
     }
 
     async fn post_with_timeout<T, R>(
@@ -392,10 +415,11 @@ impl TelegramClient {
         file_name: &str,
         mime_type: Option<&str>,
     ) -> Result<Message> {
-        let url = format!("{}/bot{}/{}", self.api_base, self.token, method);
         let bytes = tokio::fs::read(path)
             .await
             .with_context(|| format!("failed to read upload file {}", path.display()))?;
+        self.outbound.wait(chat_id).await;
+        let url = format!("{}/bot{}/{}", self.api_base, self.token, method);
         let part = if let Some(mime_type) = mime_type {
             match Part::bytes(bytes.clone())
                 .file_name(file_name.to_string())
@@ -433,6 +457,9 @@ impl TelegramClient {
             let parsed = serde_json::from_str::<ApiResponse<Message>>(&body).ok();
             if let Some(parsed) = parsed {
                 if let Some(parameters) = parsed.parameters {
+                    if let Some(retry_after) = parameters.retry_after {
+                        self.outbound.backoff(chat_id, retry_after).await;
+                    }
                     return Err(TelegramError {
                         status,
                         description: parsed
@@ -454,6 +481,13 @@ impl TelegramClient {
         let parsed: ApiResponse<Message> = serde_json::from_str(&body)
             .with_context(|| format!("telegram {method} JSON decode failed"))?;
         if !parsed.ok {
+            if let Some(retry_after) = parsed
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.retry_after)
+            {
+                self.outbound.backoff(chat_id, retry_after).await;
+            }
             return Err(TelegramError {
                 status,
                 description: parsed
@@ -470,6 +504,97 @@ impl TelegramClient {
             .result
             .ok_or_else(|| anyhow::anyhow!("telegram {method} returned ok without result"))
     }
+}
+
+#[derive(Debug)]
+struct OutboundRateLimiter {
+    state: Mutex<OutboundLimiterState>,
+}
+
+impl Default for OutboundRateLimiter {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(OutboundLimiterState::default()),
+        }
+    }
+}
+
+impl OutboundRateLimiter {
+    async fn wait(&self, chat_id: i64) {
+        loop {
+            let next = {
+                let mut state = self.state.lock().await;
+                state.acquire(chat_id, Instant::now())
+            };
+            match next {
+                Ok(()) => return,
+                Err(next_at) => {
+                    let wait = next_at.saturating_duration_since(Instant::now());
+                    if !wait.is_zero() {
+                        sleep(wait).await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn note_retry_after(&self, chat_id: i64, error: &anyhow::Error) {
+        if let Some(retry_after) = telegram_retry_after(error) {
+            self.backoff(chat_id, retry_after).await;
+        }
+    }
+
+    async fn backoff(&self, chat_id: i64, retry_after: u64) {
+        let mut state = self.state.lock().await;
+        state.backoff(chat_id, Instant::now(), retry_after);
+    }
+}
+
+#[derive(Debug, Default)]
+struct OutboundLimiterState {
+    next_global_at: Option<Instant>,
+    next_chat_at: HashMap<i64, Instant>,
+}
+
+impl OutboundLimiterState {
+    fn acquire(&mut self, chat_id: i64, now: Instant) -> std::result::Result<(), Instant> {
+        let slot = self.next_available_at(chat_id, now);
+        if slot > now {
+            return Err(slot);
+        }
+        self.next_global_at =
+            Some(now + Duration::from_millis(TELEGRAM_GLOBAL_OUTBOUND_INTERVAL_MS));
+        self.next_chat_at
+            .insert(chat_id, now + outbound_interval_for_chat(chat_id));
+        Ok(())
+    }
+
+    fn next_available_at(&self, chat_id: i64, now: Instant) -> Instant {
+        let next_global = self.next_global_at.unwrap_or(now);
+        let next_chat = self.next_chat_at.get(&chat_id).copied().unwrap_or(now);
+        next_global.max(next_chat).max(now)
+    }
+
+    fn backoff(&mut self, chat_id: i64, now: Instant, retry_after: u64) {
+        let until = now + Duration::from_secs(retry_after.saturating_add(1));
+        self.next_global_at = Some(self.next_global_at.unwrap_or(now).max(until));
+        let next_chat = self.next_chat_at.entry(chat_id).or_insert(now);
+        *next_chat = (*next_chat).max(until);
+    }
+}
+
+pub fn outbound_interval_for_chat(chat_id: i64) -> Duration {
+    if chat_id < 0 {
+        Duration::from_millis(TELEGRAM_GROUP_OUTBOUND_INTERVAL_MS)
+    } else {
+        Duration::from_millis(TELEGRAM_PRIVATE_OUTBOUND_INTERVAL_MS)
+    }
+}
+
+fn telegram_retry_after(error: &anyhow::Error) -> Option<u64> {
+    error
+        .downcast_ref::<TelegramError>()
+        .and_then(|telegram| telegram.retry_after)
 }
 
 #[derive(Debug)]
@@ -632,6 +757,16 @@ pub struct EditMessageText {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SendMessageDraft {
+    pub chat_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_thread_id: Option<i64>,
+    pub draft_id: i64,
+    pub text: String,
+    pub parse_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct InlineKeyboardMarkup {
     pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
 }
@@ -697,6 +832,18 @@ impl EditMessageText {
     }
 }
 
+impl SendMessageDraft {
+    pub fn html(chat_id: i64, thread_id: Option<i64>, draft_id: i64, text: String) -> Self {
+        Self {
+            chat_id,
+            message_thread_id: thread_id,
+            draft_id,
+            text,
+            parse_mode: "HTML".to_string(),
+        }
+    }
+}
+
 pub fn normalize_command(text: &str, bot_username: Option<&str>) -> Option<(String, String)> {
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
@@ -749,6 +896,104 @@ pub fn preferred_image_file_id(message: &Message) -> Option<&str> {
         .iter()
         .max_by_key(|size| size.file_size.unwrap_or(size.width * size.height))
         .map(|photo| photo.file_id.as_str())
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_limiter_spaces_group_messages() {
+        let mut state = OutboundLimiterState::default();
+        let now = Instant::now();
+
+        let first = state.acquire(-100123, now);
+        let second = state.acquire(-100123, now);
+
+        assert_eq!(first, Ok(()));
+        assert_eq!(
+            second.unwrap_err().duration_since(now),
+            Duration::from_millis(TELEGRAM_GROUP_OUTBOUND_INTERVAL_MS)
+        );
+    }
+
+    #[test]
+    fn outbound_limiter_spaces_private_messages() {
+        let mut state = OutboundLimiterState::default();
+        let now = Instant::now();
+
+        let first = state.acquire(123, now);
+        let second = state.acquire(123, now);
+
+        assert_eq!(first, Ok(()));
+        assert_eq!(
+            second.unwrap_err().duration_since(now),
+            Duration::from_millis(TELEGRAM_PRIVATE_OUTBOUND_INTERVAL_MS)
+        );
+    }
+
+    #[test]
+    fn outbound_limiter_applies_global_spacing_between_chats() {
+        let mut state = OutboundLimiterState::default();
+        let now = Instant::now();
+
+        let first = state.acquire(1, now);
+        let second = state.acquire(2, now);
+
+        assert_eq!(first, Ok(()));
+        assert_eq!(
+            second.unwrap_err().duration_since(now),
+            Duration::from_millis(TELEGRAM_GLOBAL_OUTBOUND_INTERVAL_MS)
+        );
+    }
+
+    #[test]
+    fn outbound_limiter_extends_chat_after_retry_after() {
+        let mut state = OutboundLimiterState::default();
+        let now = Instant::now();
+        state.backoff(-100123, now, 7);
+
+        let next = state.acquire(-100123, now);
+
+        assert_eq!(
+            next.unwrap_err().duration_since(now),
+            Duration::from_secs(8)
+        );
+    }
+
+    #[test]
+    fn outbound_limiter_rechecks_backoff_after_waiting() {
+        let mut state = OutboundLimiterState::default();
+        let now = Instant::now();
+
+        assert_eq!(state.acquire(-100123, now), Ok(()));
+        let queued_at = state.acquire(-100123, now).unwrap_err();
+        state.backoff(-100123, now, 7);
+
+        assert_eq!(
+            queued_at.duration_since(now),
+            Duration::from_millis(TELEGRAM_GROUP_OUTBOUND_INTERVAL_MS)
+        );
+        assert_eq!(
+            state
+                .acquire(-100123, queued_at)
+                .unwrap_err()
+                .duration_since(now),
+            Duration::from_secs(8)
+        );
+    }
+
+    #[test]
+    fn send_message_draft_payload_includes_draft_id() {
+        let payload = SendMessageDraft::html(42, Some(7), 123, "partial".to_string());
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["chat_id"], 42);
+        assert_eq!(value["message_thread_id"], 7);
+        assert_eq!(value["draft_id"], 123);
+        assert_eq!(value["text"], "partial");
+        assert_eq!(value["parse_mode"], "HTML");
+    }
 }
 
 #[cfg(test)]

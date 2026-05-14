@@ -23,52 +23,76 @@ pub(super) async fn process_turn(
 
     let cancel = CancellationToken::new();
     *cancel_slot.lock().expect("cancel mutex poisoned") = Some(cancel.clone());
-    let chat_action_task = spawn_chat_action_task(
+    let mut chat_action_task = Some(spawn_chat_action_task(
         shared.telegram.clone(),
         session.key.chat_id,
         Some(session.key.thread_id).filter(|value| *value != 0),
         cancel.clone(),
-    );
+    ));
     let limits_inline = latest_limits_snapshot_from_shared(&shared)
-        .await?
-        .and_then(|snapshot| format_limits_inline(&snapshot));
+        .await
+        .map_err(|error| {
+            tracing::warn!("failed to read latest limits snapshot: {error:#}");
+            error
+        })
+        .ok()
+        .and_then(|snapshot| snapshot.and_then(|snapshot| format_limits_inline(&snapshot)));
+    let turn_banner = turn_start_banner(limits_inline, &session);
     let thinking_text = "⏳";
-    let placeholder_text = render_placeholder_html(thinking_text, limits_inline.as_deref());
-
-    if shared.config.telegram.use_message_drafts && queued.chat_kind == "private" {
-        if let Err(error) = shared
+    let placeholder_text = render_placeholder_html(thinking_text, turn_banner.as_deref());
+    let thread_id = Some(session.key.thread_id).filter(|value| *value != 0);
+    let draft_id = turn_id;
+    let sink = if shared.config.telegram.use_message_drafts && queued.chat_kind == "private" {
+        match shared
             .telegram
-            .send_message_draft(
+            .send_message_draft(SendMessageDraft::html(
                 session.key.chat_id,
-                Some(session.key.thread_id).filter(|id| *id != 0),
-                thinking_text,
-            )
+                thread_id,
+                draft_id,
+                placeholder_text.clone(),
+            ))
             .await
         {
-            tracing::debug!(
-                "sendMessageDraft failed, falling back to placeholder message: {error:#}"
-            );
+            Ok(_) => Arc::new(Mutex::new(LiveTurnSink::new_draft(
+                shared.clone(),
+                &session,
+                turn_banner,
+                draft_id,
+            ))),
+            Err(error) => {
+                tracing::debug!(
+                    "sendMessageDraft failed, falling back to placeholder message: {error:#}"
+                );
+                create_preview_sink_or_fail(
+                    shared.clone(),
+                    cancel_slot.clone(),
+                    cancel.clone(),
+                    &mut chat_action_task,
+                    &queued,
+                    &session,
+                    turn_id,
+                    &turn_workspace,
+                    turn_banner,
+                    placeholder_text,
+                )
+                .await?
+            }
         }
-    }
-
-    let placeholder = shared
-        .telegram
-        .send_message(SendMessage::html(
-            session.key.chat_id,
-            Some(session.key.thread_id).filter(|value| *value != 0),
+    } else {
+        create_preview_sink_or_fail(
+            shared.clone(),
+            cancel_slot.clone(),
+            cancel.clone(),
+            &mut chat_action_task,
+            &queued,
+            &session,
+            turn_id,
+            &turn_workspace,
+            turn_banner,
             placeholder_text,
-        ))
-        .await
-        .context("failed to create placeholder message")?;
-    let sink = Arc::new(Mutex::new(LiveTurnSink::new(
-        shared.clone(),
-        &session,
-        limits_inline,
-        TelegramMessageRef {
-            chat_id: session.key.chat_id,
-            message_id: placeholder.message_id,
-        },
-    )));
+        )
+        .await?
+    };
     let mut runtime_request = queued.request.clone();
     enrich_audio_transcripts(&shared, &mut runtime_request, &turn_workspace, &sink).await;
     let runtime_request = prepare_runtime_request(&session, &runtime_request, &turn_workspace);
@@ -123,7 +147,9 @@ pub(super) async fn process_turn(
 
     *cancel_slot.lock().expect("cancel mutex poisoned") = None;
     cancel.cancel();
-    let _ = chat_action_task.await;
+    if let Some(chat_action_task) = chat_action_task.take() {
+        let _ = chat_action_task.await;
+    }
     let final_result = async {
         match run_result {
             Ok(summary) => {
@@ -192,6 +218,65 @@ pub(super) async fn process_turn(
         &turn_workspace.root,
         final_result,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_preview_sink_or_fail(
+    shared: Arc<AppShared>,
+    cancel_slot: Arc<StdMutex<Option<CancellationToken>>>,
+    cancel: CancellationToken,
+    chat_action_task: &mut Option<tokio::task::JoinHandle<()>>,
+    queued: &QueuedTurn,
+    session: &crate::models::SessionRecord,
+    turn_id: i64,
+    turn_workspace: &TurnWorkspace,
+    turn_banner: Option<String>,
+    placeholder_text: String,
+) -> Result<Arc<Mutex<LiveTurnSink>>> {
+    let placeholder = match shared
+        .telegram
+        .send_message(SendMessage::html(
+            session.key.chat_id,
+            Some(session.key.thread_id).filter(|value| *value != 0),
+            placeholder_text,
+        ))
+        .await
+        .context("failed to create placeholder message")
+    {
+        Ok(placeholder) => placeholder,
+        Err(error) => {
+            *cancel_slot.lock().expect("cancel mutex poisoned") = None;
+            cancel.cancel();
+            if let Some(chat_action_task) = chat_action_task.take() {
+                let _ = chat_action_task.await;
+            }
+            if let Some(retry_after) = telegram_retry_after(&error) {
+                notify_pre_codex_rate_limit(
+                    shared.clone(),
+                    session.key,
+                    turn_id,
+                    retry_after,
+                    queued.request.attachments.is_empty(),
+                );
+            }
+            finish_pre_codex_turn_failure(&shared, session, turn_id, &error)?;
+            return finish_turn_cleanup(
+                &queued.request.attachments,
+                &turn_workspace.root,
+                Err(error),
+            );
+        }
+    };
+
+    Ok(Arc::new(Mutex::new(LiveTurnSink::new_preview(
+        shared,
+        session,
+        turn_banner,
+        TelegramMessageRef {
+            chat_id: session.key.chat_id,
+            message_id: placeholder.message_id,
+        },
+    ))))
 }
 
 fn cleanup_paths(attachments: &[LocalAttachment], turn_root: &Path) {
@@ -306,6 +391,88 @@ async fn finish_failed_turn(
     Ok(())
 }
 
+fn finish_pre_codex_turn_failure(
+    shared: &Arc<AppShared>,
+    session: &crate::models::SessionRecord,
+    turn_id: i64,
+    error: &anyhow::Error,
+) -> Result<()> {
+    shared.store.set_session_busy(session.key, false)?;
+    let assistant_text = if let Some(retry_after) = telegram_retry_after(error) {
+        format!(
+            "Telegram rate limit prevented this turn from starting. Retry after {retry_after}s."
+        )
+    } else {
+        format!("Turn failed before Codex started: {error:#}")
+    };
+    shared
+        .store
+        .record_turn_finished(turn_id, "failed", Some(&assistant_text))?;
+    Ok(())
+}
+
+fn notify_pre_codex_rate_limit(
+    shared: Arc<AppShared>,
+    session_key: SessionKey,
+    turn_id: i64,
+    retry_after: u64,
+    can_retry: bool,
+) {
+    tokio::spawn(async move {
+        let mut wait_seconds = retry_after.saturating_add(1);
+        for attempt in 0..3 {
+            sleep(Duration::from_secs(wait_seconds)).await;
+            let mut request = SendMessage::html(
+                session_key.chat_id,
+                Some(session_key.thread_id).filter(|value| *value != 0),
+                render_pre_codex_rate_limit_notice(turn_id, retry_after, can_retry),
+            );
+            if can_retry {
+                request.reply_markup = Some(rate_limit_retry_keyboard(turn_id));
+            }
+            match shared.telegram.send_message(request).await {
+                Ok(_) => return,
+                Err(error) => {
+                    if let Some(next_retry_after) = telegram_retry_after(&error) {
+                        wait_seconds = next_retry_after.saturating_add(1);
+                        tracing::warn!(
+                            "Telegram still rate-limited retry notice for turn {turn_id}; attempt {} retry after {next_retry_after}s",
+                            attempt + 1
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        "failed to send Telegram rate-limit retry notice for turn {turn_id}: {error:#}"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn render_pre_codex_rate_limit_notice(turn_id: i64, retry_after: u64, can_retry: bool) -> String {
+    let retry_line = if can_retry {
+        "I waited for the recommended backoff. Use Retry to send the same prompt again."
+    } else {
+        "I waited for the recommended backoff. Send the request again manually because attachments cannot be retried."
+    };
+    format!(
+        "Telegram rate limit hit before Codex could start turn <code>{turn_id}</code>.\n\
+         Telegram asked to retry after <code>{retry_after}s</code>.\n\n{retry_line}"
+    )
+}
+
+pub(super) fn rate_limit_retry_keyboard(turn_id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton {
+            text: "Retry".to_string(),
+            callback_data: Some(format!("cmd:/retry {turn_id}")),
+            url: None,
+        }]],
+    }
+}
+
 async fn notify_turn_completion(shared: &Arc<AppShared>, session_key: SessionKey) {
     let Some(text) =
         turn_completion_notification_text(&shared.config.telegram.completion_notify_usernames)
@@ -348,6 +515,7 @@ struct LiveTurnSink {
     shared: Arc<AppShared>,
     session_key: SessionKey,
     messages: Vec<TelegramMessageRef>,
+    draft_id: Option<i64>,
     limits_inline: Option<String>,
     pending_text: String,
     has_assistant_text: bool,
@@ -357,7 +525,7 @@ struct LiveTurnSink {
 }
 
 impl LiveTurnSink {
-    fn new(
+    fn new_preview(
         shared: Arc<AppShared>,
         session: &crate::models::SessionRecord,
         limits_inline: Option<String>,
@@ -367,6 +535,27 @@ impl LiveTurnSink {
             shared,
             session_key: session.key,
             messages: vec![placeholder],
+            draft_id: None,
+            limits_inline,
+            pending_text: "⏳".to_string(),
+            has_assistant_text: false,
+            last_flushed_text: String::new(),
+            last_flush_at: Instant::now() - Duration::from_secs(60),
+            edit_backoff_until: None,
+        }
+    }
+
+    fn new_draft(
+        shared: Arc<AppShared>,
+        session: &crate::models::SessionRecord,
+        limits_inline: Option<String>,
+        draft_id: i64,
+    ) -> Self {
+        Self {
+            shared,
+            session_key: session.key,
+            messages: Vec::new(),
+            draft_id: Some(draft_id),
             limits_inline,
             pending_text: "⏳".to_string(),
             has_assistant_text: false,
@@ -432,18 +621,19 @@ impl LiveTurnSink {
             return Ok(());
         }
         let visible_text = self.visible_text(force);
+        let min_flush_interval = self.min_flush_interval();
         if !force
             && self.last_flushed_text == visible_text
-            && self.last_flush_at.elapsed()
-                < Duration::from_millis(self.shared.config.edit_debounce_ms)
+            && self.last_flush_at.elapsed() < min_flush_interval
         {
             return Ok(());
         }
-        if !force
-            && self.last_flush_at.elapsed()
-                < Duration::from_millis(self.shared.config.edit_debounce_ms)
-        {
+        if !force && self.last_flush_at.elapsed() < min_flush_interval {
             return Ok(());
+        }
+
+        if self.draft_id.is_some() && !force {
+            return self.flush_draft(&visible_text).await;
         }
 
         let chunks = if force {
@@ -456,10 +646,15 @@ impl LiveTurnSink {
         };
         for (idx, chunk) in chunks.iter().enumerate() {
             let html = render_markdown_to_html(chunk);
-            if let Some(existing) = self.messages.get(idx).cloned() {
+            if let Some(existing) = self
+                .messages
+                .get(idx)
+                .cloned()
+                .filter(|_| self.draft_id.is_none())
+            {
                 self.edit_message(existing, chunk, &html).await?;
             } else {
-                let message = self
+                let result = self
                     .shared
                     .telegram
                     .send_message(SendMessage::html(
@@ -467,7 +662,14 @@ impl LiveTurnSink {
                         Some(self.session_key.thread_id).filter(|value| *value != 0),
                         html.clone(),
                     ))
-                    .await?;
+                    .await;
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) if self.defer_after_retry_after(&error, "telegram send chunk") => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
                 let reference = TelegramMessageRef {
                     chat_id: self.session_key.chat_id,
                     message_id: message.message_id,
@@ -478,6 +680,44 @@ impl LiveTurnSink {
 
         self.last_flushed_text = visible_text;
         self.last_flush_at = Instant::now();
+        Ok(())
+    }
+
+    fn min_flush_interval(&self) -> Duration {
+        let configured = Duration::from_millis(self.shared.config.edit_debounce_ms);
+        configured.max(crate::telegram::outbound_interval_for_chat(
+            self.session_key.chat_id,
+        ))
+    }
+
+    async fn flush_draft(&mut self, visible_text: &str) -> Result<()> {
+        let Some(draft_id) = self.draft_id else {
+            return Ok(());
+        };
+        let draft_text = truncate_for_live_update(visible_text, self.shared.config.max_text_chunk);
+        let html = render_markdown_to_html(&draft_text);
+        match self
+            .shared
+            .telegram
+            .send_message_draft(SendMessageDraft::html(
+                self.session_key.chat_id,
+                Some(self.session_key.thread_id).filter(|value| *value != 0),
+                draft_id,
+                html,
+            ))
+            .await
+        {
+            Ok(_) => {
+                self.last_flushed_text = visible_text.to_string();
+                self.last_flush_at = Instant::now();
+            }
+            Err(error) if self.defer_after_retry_after(&error, "telegram draft update") => {}
+            Err(error) => {
+                tracing::debug!("sendMessageDraft update failed: {error:#}");
+                self.last_flushed_text = visible_text.to_string();
+                self.last_flush_at = Instant::now();
+            }
+        }
         Ok(())
     }
 
@@ -574,6 +814,26 @@ fn render_placeholder_html(status: &str, limits_banner: Option<&str>) -> String 
             )
         }
         _ => format!("<i>{status}</i>"),
+    }
+}
+
+fn turn_start_banner(
+    limits_inline: Option<String>,
+    session: &crate::models::SessionRecord,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(limits_inline) = limits_inline.filter(|value| !value.trim().is_empty()) {
+        lines.push(limits_inline);
+    }
+    if session.service_tier.as_deref() == Some("fast") {
+        lines.push(
+            "⚡ Fast mode is ON for this session; Codex may use faster inference with higher plan usage. Disable it with `/fast off`.".to_string(),
+        );
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
     }
 }
 
@@ -1055,5 +1315,50 @@ fn mime_type_for_path(path: &Path) -> Option<String> {
         "md" => Some("text/markdown".to_string()),
         "json" => Some("application/json".to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SearchMode;
+
+    fn session_with_service_tier(service_tier: Option<&str>) -> crate::models::SessionRecord {
+        crate::models::SessionRecord {
+            id: 1,
+            key: SessionKey::new(1, Some(2)),
+            session_title: None,
+            codex_thread_id: None,
+            force_fresh_thread: false,
+            updated_at: "2026-03-13T10:00:00Z".to_string(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            reasoning_effort: None,
+            service_tier: service_tier.map(ToOwned::to_owned),
+            session_prompt: None,
+            sandbox_mode: "workspace-write".to_string(),
+            approval_policy: "never".to_string(),
+            search_mode: SearchMode::Disabled,
+            add_dirs: vec![],
+            busy: false,
+        }
+    }
+
+    #[test]
+    fn turn_start_banner_mentions_fast_mode() {
+        let session = session_with_service_tier(Some("fast"));
+        let banner = turn_start_banner(Some("Limits: ok".to_string()), &session).unwrap();
+
+        assert!(banner.contains("Limits: ok"));
+        assert!(banner.contains("⚡ Fast mode is ON"));
+        assert!(banner.contains("/fast off"));
+    }
+
+    #[test]
+    fn turn_start_banner_omits_fast_mode_when_disabled() {
+        let session = session_with_service_tier(None);
+        let banner = turn_start_banner(Some("Limits: ok".to_string()), &session).unwrap();
+
+        assert_eq!(banner, "Limits: ok");
     }
 }

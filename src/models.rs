@@ -64,6 +64,7 @@ pub struct SessionRecord {
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
     pub session_prompt: Option<String>,
     pub sandbox_mode: String,
     pub approval_policy: String,
