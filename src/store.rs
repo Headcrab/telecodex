@@ -536,7 +536,7 @@ impl Store {
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
                     ))
                 },
@@ -548,8 +548,11 @@ impl Store {
         if !matches!(status.as_str(), "failed" | "cancelled") {
             return Ok(None);
         }
-        let review_mode: Option<ReviewRequest> = serde_json::from_str(&review_json)
-            .with_context(|| format!("failed to parse review request for turn {turn_id}"))?;
+        let review_mode: Option<ReviewRequest> = match review_json {
+            Some(review_json) => serde_json::from_str(&review_json)
+                .with_context(|| format!("failed to parse review request for turn {turn_id}"))?,
+            None => None,
+        };
         Ok(Some(TurnRequest {
             session_key,
             from_user_id,
@@ -1018,5 +1021,42 @@ mod tests {
         assert_eq!(retry.prompt, "hello");
         assert!(retry.attachments.is_empty());
         assert_eq!(retry.review_mode.unwrap().base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn builds_retry_request_for_failed_turn_with_null_review_json() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path(), &[100], &defaults()).unwrap();
+        let session = store
+            .ensure_session(SessionKey::new(1, Some(10)), 100, &defaults())
+            .unwrap();
+        let request = TurnRequest {
+            session_key: session.key,
+            from_user_id: 100,
+            prompt: "hello".to_string(),
+            runtime_instructions: None,
+            attachments: vec![],
+            review_mode: None,
+            override_search_mode: None,
+        };
+        let turn_id = store.record_turn_started(session.id, &request).unwrap();
+        store.record_turn_finished(turn_id, "failed", None).unwrap();
+        {
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "UPDATE turns SET review_json = NULL WHERE id = ?1",
+                rusqlite::params![turn_id],
+            )
+            .unwrap();
+        }
+
+        let retry = store
+            .retry_request_for_turn(turn_id, session.key, 200)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(retry.from_user_id, 200);
+        assert_eq!(retry.prompt, "hello");
+        assert!(retry.review_mode.is_none());
     }
 }
