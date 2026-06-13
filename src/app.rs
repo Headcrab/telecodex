@@ -1286,6 +1286,9 @@ impl App {
                         .await?;
                     }
                 }
+                BridgeCommand::LaneCheck => {
+                    self.handle_lane_check_command(message).await?;
+                }
                 BridgeCommand::Copy => {
                     if let Some(text) = self.shared.store.last_assistant_text(session_key)? {
                         self.send_status(message.chat.id, message.message_thread_id, &text)
@@ -1353,6 +1356,49 @@ impl App {
             },
         }
         Ok(())
+    }
+
+    async fn handle_lane_check_command(&self, message: &Message) -> Result<()> {
+        let chat_id = message.chat.id.to_string();
+        let thread_id = message.message_thread_id.unwrap_or(0).to_string();
+        let output =
+            tokio::process::Command::new("/home/hermes/mobius-workspace/bin/lanecheck-visible")
+                .args([
+                    "--agent",
+                    "o",
+                    "--chat-id",
+                    &chat_id,
+                    "--thread-id",
+                    &thread_id,
+                    "current",
+                ])
+                .output()
+                .await
+                .context("failed to run lanecheck-visible")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            tracing::warn!(
+                status = ?output.status.code(),
+                stderr = %stderr,
+                "lanecheck-visible exited nonzero"
+            );
+        }
+
+        let response = if stdout.is_empty() {
+            if stderr.is_empty() {
+                "Lane check: error\nStatus: backend checker produced no output".to_string()
+            } else {
+                format!("Lane check: error\nStatus: backend checker failed\nError: {stderr}")
+            }
+        } else {
+            stdout
+        };
+        self.send_plain_status(message.chat.id, message.message_thread_id, &response)
+            .await
     }
 
     async fn handle_new_session(

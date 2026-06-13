@@ -1,7 +1,8 @@
 use super::presentation::{approval_waiting_text, request_telegram_approval};
 use super::support::{is_message_not_modified, session_title_is_present, telegram_retry_after};
 use super::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub(super) async fn process_turn(
@@ -97,6 +98,8 @@ pub(super) async fn process_turn(
     enrich_audio_transcripts(&shared, &mut runtime_request, &turn_workspace, &sink).await;
     let runtime_request = prepare_runtime_request(&session, &runtime_request, &turn_workspace);
     let runtime_request = enrich_runtime_request_with_codex_history(&session, runtime_request);
+    let runtime_request =
+        enrich_runtime_request_with_context_pressure(&session, runtime_request).await;
 
     let run_result = shared
         .codex
@@ -999,7 +1002,7 @@ pub(super) fn prepare_runtime_request(
     }
 
     instruction_sections.push(format!(
-        "If you generate final deliverable files for the user, save only the final files in this directory:\n{}\nKeep intermediate scratch files outside this directory.",
+        "If you generate final deliverable images or files for the user, save only the final files in this directory:\n{}\nTelecodex automatically uploads files from that directory back to Telegram after your turn completes. Do not use /tmp paths, local Markdown image links, base64 blobs, or invented upload methods to deliver files. view_image is only for local inspection. Keep intermediate scratch files outside this directory.",
         workspace.out_dir.display()
     ));
 
@@ -1013,6 +1016,87 @@ pub(super) fn prepare_runtime_request(
         tracing::debug!("session prompt is active for {:?}", session.key);
     }
     runtime_request
+}
+
+async fn enrich_runtime_request_with_context_pressure(
+    session: &crate::models::SessionRecord,
+    request: TurnRequest,
+) -> TurnRequest {
+    let Some(note) = context_pressure_note_for_session(session).await else {
+        return request;
+    };
+    apply_context_pressure_note_to_request(request, &note)
+}
+
+fn apply_context_pressure_note_to_request(mut request: TurnRequest, note: &str) -> TurnRequest {
+    // Codex app-server applies developer instructions when a thread is started or
+    // resumed, but existing-thread resume instructions are not a reliable
+    // per-turn delivery channel. Put the runtime note into the next turn's input
+    // so the model sees it immediately on milestone crossings.
+    request.prompt = if request.prompt.trim().is_empty() {
+        note.to_string()
+    } else {
+        format!("{note}\n\nUser message:\n{}", request.prompt)
+    };
+    request
+}
+
+async fn context_pressure_note_for_session(
+    session: &crate::models::SessionRecord,
+) -> Option<String> {
+    let python = std::env::var("TELECODEX_CONTEXT_PRESSURE_PYTHON")
+        .unwrap_or_else(|_| "python3".to_string());
+    let budimo_root = PathBuf::from(
+        std::env::var("TELECODEX_CONTEXT_PRESSURE_BUDIMO_ROOT")
+            .unwrap_or_else(|_| "/home/hermes/mobius-workspace/repos/budimo".to_string()),
+    );
+    let pythonpath = [
+        budimo_root.join("modules/context-common"),
+        budimo_root.join("modules/context-check"),
+        budimo_root.join("modules/context-pressure"),
+    ]
+    .into_iter()
+    .map(|path| path.display().to_string())
+    .collect::<Vec<_>>()
+    .join(":");
+    let mut command = tokio::process::Command::new(python);
+    command
+        .arg("-m")
+        .arg("context_pressure.preturn")
+        .arg("--agent")
+        .arg("o")
+        .arg("--thread-id")
+        .arg(session.key.thread_id.to_string())
+        .env("PYTHONPATH", pythonpath);
+    if let Ok(store) = std::env::var("CONTEXT_PRESSURE_ACTIVATION_STORE") {
+        command.arg("--store").arg(store);
+    }
+    if let Ok(state_store) = std::env::var("CONTEXT_PRESSURE_STATE_STORE") {
+        command.arg("--state-store").arg(state_store);
+    }
+    if std::env::var("CONTEXT_PRESSURE_ALLOW_DRY_RUN").as_deref() == Ok("1") {
+        command.arg("--allow-dry-run");
+    }
+    let output = match tokio::time::timeout(Duration::from_millis(900), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            tracing::debug!("context pressure preturn helper failed to spawn: {error:#}");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("context pressure preturn helper timed out");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::debug!(
+            "context pressure preturn helper exited with status {:?}",
+            output.status.code()
+        );
+        return None;
+    }
+    let note = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if note.is_empty() { None } else { Some(note) }
 }
 
 fn enrich_runtime_request_with_codex_history(
@@ -1354,6 +1438,35 @@ mod tests {
         assert!(banner.contains("/fast off"));
     }
 
+
+
+    #[test]
+    fn context_pressure_note_enters_turn_prompt_input() {
+        let request = TurnRequest {
+            session_key: SessionKey::new(1, Some(2)),
+            from_user_id: 42,
+            prompt: "Hi. What should we do next?".to_string(),
+            runtime_instructions: Some("existing runtime instruction".to_string()),
+            attachments: vec![],
+            review_mode: None,
+            override_search_mode: None,
+        };
+
+        let enriched = apply_context_pressure_note_to_request(
+            request,
+            "[CONTEXT PRESSURE] 200K reached; preserve state.",
+        );
+
+        assert!(enriched
+            .prompt
+            .starts_with("[CONTEXT PRESSURE] 200K reached; preserve state."));
+        assert!(enriched.prompt.contains("User message:
+Hi. What should we do next?"));
+        assert_eq!(
+            enriched.runtime_instructions.as_deref(),
+            Some("existing runtime instruction")
+        );
+    }
     #[test]
     fn turn_start_banner_omits_fast_mode_when_disabled() {
         let session = session_with_service_tier(None);
