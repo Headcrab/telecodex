@@ -195,6 +195,20 @@ impl App {
         }
     }
 
+    pub(super) async fn send_plain_status(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+    ) -> Result<()> {
+        for chunk in split_text(text, self.shared.config.max_text_chunk) {
+            let html = html_escape::encode_safe(&chunk).to_string();
+            self.send_html_status(chat_id, thread_id, &html, Some(&chunk))
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn send_html_status(
         &self,
         chat_id: i64,

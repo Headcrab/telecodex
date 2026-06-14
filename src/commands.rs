@@ -42,6 +42,7 @@ pub enum BridgeCommand {
     Search { mode: SearchMode },
     AddDir { path: String },
     Limits,
+    LaneCheck,
     Copy,
     Clear,
     RestartBot,
@@ -161,6 +162,7 @@ pub fn parse_command(command: &str, args: &str, original_text: &str) -> Result<P
             path: required_arg(args, "/add-dir <absolute_path>")?.to_string(),
         },
         "/limits" => BridgeCommand::Limits,
+        "/lane_check" | "/lane-check" => BridgeCommand::LaneCheck,
         "/copy" => BridgeCommand::Copy,
         "/clear" => BridgeCommand::Clear,
         "/restart_bot" => BridgeCommand::RestartBot,
@@ -272,6 +274,7 @@ pub fn default_bot_commands() -> Vec<BotCommand> {
         bot_command("search", "Set web search mode"),
         bot_command("add_dir", "Add writable directory"),
         bot_command("limits", "Show latest Codex rate limits snapshot"),
+        bot_command("lane_check", "Show lane check for this topic"),
         bot_command("review", "Run codex review"),
         bot_command("environments", "Show importable Codex environments"),
         bot_command("sessions", "List sessions in this chat"),
@@ -496,6 +499,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_lane_check_aliases_as_bridge_commands() {
+        for command in ["/lane_check", "/lane-check"] {
+            let parsed = parse_command(command, "", command).unwrap();
+            match parsed {
+                ParsedInput::Bridge(BridgeCommand::LaneCheck) => {}
+                _ => panic!("unexpected lane check variant for {command}"),
+            }
+        }
+    }
+
+    #[test]
     fn provides_choice_help_for_fixed_value_commands() {
         let help = command_help("/sandbox", "").unwrap();
         assert!(help.text.contains("/sandbox read-only"));
@@ -540,6 +554,7 @@ mod tests {
             ("/search on", ParsedInputKind::Bridge),
             ("/add_dir /workspace/shared", ParsedInputKind::Bridge),
             ("/limits", ParsedInputKind::Bridge),
+            ("/lane_check", ParsedInputKind::Bridge),
             ("/review --uncommitted", ParsedInputKind::Bridge),
             ("/environments", ParsedInputKind::Bridge),
             ("/sessions", ParsedInputKind::Bridge),
