@@ -58,6 +58,7 @@ No webhook infrastructure. No browser dependency. No cloud relay between Telegra
 - Polls Telegram Bot API via `getUpdates`.
 - Maintains one logical session per Telegram chat/topic pair.
 - Queues turns per session and streams progress with private chat drafts or in-place Telegram message edits.
+- Steers an active Codex turn with new plain-text messages, matching Codex's mid-turn follow-up behavior; messages with attachments remain queued as separate turns.
 - Queues outbound Telegram deliveries per chat, applies a safer group/topic send cadence, and backs off when Telegram returns `retry_after`.
 - Supports `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, `/retry`, `/fast`, and per-session runtime settings.
 - Can bind a Telegram topic to an existing Codex thread by thread id or `latest`.
@@ -120,7 +121,7 @@ High-level flow:
 
 1. Telegram sends updates through long polling.
 2. Telecodex resolves the active session for the current chat/topic.
-3. Incoming text and attachments are converted into a Codex turn request.
+3. Incoming text and attachments are converted into a Codex turn request. While a normal turn is active, new plain-text messages are sent to Codex through `turn/steer`; if steering is unavailable or terminally rejected, they fall back to the session queue.
 4. Codex runs locally in the configured workspace.
 5. Progress is streamed back with private chat drafts or Telegram message edits.
 6. Files produced in the turn output directory are uploaded back to Telegram.

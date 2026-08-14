@@ -28,7 +28,7 @@ mod turns;
 use crate::{
     codex::{
         AvailableModel, CodexApprovalDecision, CodexApprovalKind, CodexEvent, CodexEventOutcome,
-        CodexRunner,
+        CodexRunner, CodexSteerRequest,
     },
     codex_history::{
         CodexEnvironmentSummary, CodexHistoryEntry, CodexThreadSummary,
@@ -87,6 +87,13 @@ struct AppShared {
 struct SessionWorkerHandle {
     sender: mpsc::UnboundedSender<QueuedTurn>,
     cancel: Arc<StdMutex<Option<CancellationToken>>>,
+    steer: Arc<StdMutex<Option<ActiveTurnSteerHandle>>>,
+}
+
+#[derive(Clone)]
+struct ActiveTurnSteerHandle {
+    turn_id: i64,
+    sender: mpsc::UnboundedSender<CodexSteerRequest>,
 }
 
 #[derive(Clone)]
@@ -392,6 +399,13 @@ impl App {
         let session = self.maybe_assign_session_title_from_text(session, text)?;
         self.announce_session_if_switched(from.id, &message.chat, session.key, &session)
             .await?;
+        if is_text_only_steer_candidate(&message, text)
+            && self
+                .try_steer_active_turn(session.key, from.id, text)
+                .await?
+        {
+            return Ok(());
+        }
         let attachments = self.download_attachments(&message, &session).await?;
         if text.is_empty() && attachments.is_empty() {
             return Ok(());
@@ -1626,6 +1640,64 @@ impl App {
         Ok(())
     }
 
+    /// Attempts to append text to the current turn and only permits queue fallback after a
+    /// terminal rejection or a closed response channel.
+    async fn try_steer_active_turn(
+        &self,
+        session_key: SessionKey,
+        from_user_id: i64,
+        text: &str,
+    ) -> Result<bool> {
+        let active = {
+            let workers = self.workers.lock().await;
+            let Some(worker) = workers.get(&session_key) else {
+                return Ok(false);
+            };
+            let active = worker.steer.lock().expect("steer mutex poisoned").clone();
+            active
+        };
+        let Some(active) = active else {
+            return Ok(false);
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+        if active
+            .sender
+            .send(CodexSteerRequest {
+                text: text.to_string(),
+                response: response_tx,
+            })
+            .is_err()
+        {
+            return Ok(false);
+        }
+
+        match response_rx.await {
+            Ok(Ok(())) => {
+                if let Err(error) = self.shared.store.audit(
+                    Some(from_user_id),
+                    "turn_steered",
+                    serde_json::json!({
+                        "chat_id": session_key.chat_id,
+                        "thread_id": session_key.thread_id,
+                        "turn_id": active.turn_id,
+                    }),
+                ) {
+                    tracing::warn!("failed to audit accepted turn steer: {error:#}");
+                }
+                Ok(true)
+            }
+            Ok(Err(error)) => {
+                tracing::debug!("active turn rejected steering; queueing as a new turn: {error}");
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::debug!("active turn steering channel closed; queueing as a new turn");
+                Ok(false)
+            }
+        }
+    }
+
     async fn worker_for(&self, key: SessionKey) -> Result<SessionWorkerHandle> {
         if let Some(existing) = self.workers.lock().await.get(&key).cloned() {
             return Ok(existing);
@@ -1633,16 +1705,20 @@ impl App {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<QueuedTurn>();
         let cancel = Arc::new(StdMutex::new(None));
+        let steer = Arc::new(StdMutex::new(None));
         let handle = SessionWorkerHandle {
             sender: tx.clone(),
             cancel: cancel.clone(),
+            steer: steer.clone(),
         };
         self.workers.lock().await.insert(key, handle.clone());
 
         let shared = self.shared.clone();
         tokio::spawn(async move {
             while let Some(turn) = rx.recv().await {
-                if let Err(error) = process_turn(shared.clone(), cancel.clone(), turn).await {
+                if let Err(error) =
+                    process_turn(shared.clone(), cancel.clone(), steer.clone(), turn).await
+                {
                     tracing::error!("turn failed for {:?}: {error:#}", key);
                 }
             }
@@ -1777,6 +1853,16 @@ impl App {
             Self::HISTORY_PAGE_CACHE_MAX_ENTRIES,
         );
     }
+}
+
+/// Returns whether a Telegram message can safely be appended to an in-flight text turn.
+fn is_text_only_steer_candidate(message: &Message, text: &str) -> bool {
+    !text.is_empty()
+        && message.photo.is_empty()
+        && message.document.is_none()
+        && message.audio.is_none()
+        && message.voice.is_none()
+        && message.video.is_none()
 }
 
 async fn shutdown_signal(shutdown: CancellationToken) {
