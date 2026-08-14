@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -16,7 +16,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
     time::{Duration, Instant, sleep_until},
 };
@@ -75,6 +75,19 @@ pub enum CodexEventOutcome {
     None,
     Approval(CodexApprovalDecision),
 }
+
+pub type CodexSteerResponse = std::result::Result<(), String>;
+
+pub struct CodexSteerRequest {
+    pub text: String,
+    pub response: oneshot::Sender<CodexSteerResponse>,
+}
+
+struct PendingSteer {
+    expected_turn_id: String,
+    response: oneshot::Sender<CodexSteerResponse>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
     pub program: PathBuf,
@@ -267,6 +280,7 @@ impl CodexRunner {
         session: &SessionRecord,
         request: &TurnRequest,
         cancel: CancellationToken,
+        steer_rx: mpsc::UnboundedReceiver<CodexSteerRequest>,
         mut on_event: F,
     ) -> Result<RunSummary>
     where
@@ -276,7 +290,15 @@ impl CodexRunner {
         if let Some(spec) = self.build_review_command(session, request) {
             return run_review_turn(spec, cancel, on_event).await;
         }
-        run_app_server_turn(&self.binary, session, request, cancel, &mut on_event).await
+        run_app_server_turn(
+            &self.binary,
+            session,
+            request,
+            cancel,
+            steer_rx,
+            &mut on_event,
+        )
+        .await
     }
 }
 
@@ -360,6 +382,7 @@ async fn run_app_server_turn<F, Fut>(
     session: &SessionRecord,
     request: &TurnRequest,
     cancel: CancellationToken,
+    mut steer_rx: mpsc::UnboundedReceiver<CodexSteerRequest>,
     on_event: &mut F,
 ) -> Result<RunSummary>
 where
@@ -382,7 +405,10 @@ where
         )
         .await?;
     let mut active_turn_id: Option<String> = None;
-    let mut interrupt_sent = false;
+    let mut interrupt_request_id: Option<u64> = None;
+    let mut queued_steers = VecDeque::new();
+    let mut pending_steers = HashMap::new();
+    let mut steering_open = true;
     let mut cancel_deadline: Option<Instant> = None;
     let mut turn_error: Option<String> = None;
     let mut cancelled = false;
@@ -390,10 +416,22 @@ where
     let mut assistant_message_completed = false;
     while !turn_completed {
         tokio::select! {
-          _=cancel.cancelled(), if !interrupt_sent => {
-            if let Some(turn_id)=active_turn_id.as_deref(){process.send_request("turn/interrupt",json!({"threadId":thread_id,"turnId":turn_id})).await?; interrupt_sent=true; cancelled=true; cancel_deadline=Some(Instant::now()+Duration::from_secs(5)); let _ = on_event(CodexEvent::Progress("Interrupt requested.".to_string())).await?;} else {cancelled=true; break;}
+          _=cancel.cancelled(), if interrupt_request_id.is_none() => {
+            if let Some(turn_id)=active_turn_id.as_deref(){interrupt_request_id=Some(process.send_request("turn/interrupt",json!({"threadId":thread_id,"turnId":turn_id})).await?); cancelled=true; cancel_deadline=Some(Instant::now()+Duration::from_secs(5)); let _ = on_event(CodexEvent::Progress("Interrupt requested.".to_string())).await?;} else {cancelled=true; break;}
           }
           _=async{if let Some(deadline)=cancel_deadline{sleep_until(deadline).await;}}, if cancel_deadline.is_some() => {cancelled=true; break;}
+          steer=steer_rx.recv(), if steering_open => {
+            match steer {
+                Some(steer) => {
+                    if let Some(turn_id)=active_turn_id.as_deref() {
+                        send_steer_request(&mut process,&thread_id,turn_id,steer,&mut pending_steers).await?;
+                    } else {
+                        queued_steers.push_back(steer);
+                    }
+                }
+                None => steering_open=false,
+            }
+          }
           next_message=process.next_message()=>{
             let Some(message)=next_message? else {break;};
             match message{
@@ -406,17 +444,27 @@ where
                     if let Some(turn_id)=result.as_ref().and_then(|v|v.get("turn")).and_then(|t|t.get("id")).and_then(Value::as_str){
                         active_turn_id=Some(turn_id.to_string());
                     }
-                } else if error.is_some() && interrupt_sent {
-                    turn_error=Some(format!("turn/interrupt failed: {}",format_rpc_error(error.as_ref().expect("interrupt error missing"))));
-                    break;
+                } else if let Some(pending)=pending_steers.remove(&id) {
+                    let _=pending.response.send(steer_response(&pending.expected_turn_id,result.as_ref(),error.as_ref()));
+                } else if interrupt_request_id==Some(id) {
+                    if let Some(error)=error {
+                        turn_error=Some(format!("turn/interrupt failed: {}",format_rpc_error(&error)));
+                        break;
+                    }
                 }
               }
               RpcMessage::Notification{method,params}=>{handle_notification(&method,&params,&mut summary,&mut active_turn_id,&mut turn_error,&mut turn_completed,&mut assistant_message_completed,on_event).await?;}
                 RpcMessage::ServerRequest{id,method,params}=>{handle_server_request(&mut process,id,&method,&params,on_event).await?;}
             }
+            if let Some(turn_id)=active_turn_id.as_deref() {
+                while let Some(steer)=queued_steers.pop_front() {
+                    send_steer_request(&mut process,&thread_id,turn_id,steer,&mut pending_steers).await?;
+                }
+            }
           }
         }
     }
+    reject_outstanding_steers(queued_steers, pending_steers);
     summary.stderr_text = process.shutdown().await?;
     if let Some(error) = turn_error {
         bail!("{error}");
@@ -425,6 +473,70 @@ where
         bail!("codex turn cancelled");
     }
     Ok(summary)
+}
+
+async fn send_steer_request(
+    process: &mut AppServerProcess,
+    thread_id: &str,
+    turn_id: &str,
+    steer: CodexSteerRequest,
+    pending_steers: &mut HashMap<u64, PendingSteer>,
+) -> Result<()> {
+    let request_id = process
+        .send_request(
+            "turn/steer",
+            build_turn_steer_params(thread_id, turn_id, &steer.text),
+        )
+        .await?;
+    pending_steers.insert(
+        request_id,
+        PendingSteer {
+            expected_turn_id: turn_id.to_string(),
+            response: steer.response,
+        },
+    );
+    Ok(())
+}
+
+fn build_turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": text}],
+        "expectedTurnId": turn_id,
+    })
+}
+
+fn steer_response(
+    expected_turn_id: &str,
+    result: Option<&Value>,
+    error: Option<&RpcError>,
+) -> CodexSteerResponse {
+    if let Some(error) = error {
+        return Err(format_rpc_error(error));
+    }
+    match result
+        .and_then(|value| value.get("turnId"))
+        .and_then(Value::as_str)
+    {
+        Some(turn_id) if turn_id == expected_turn_id => Ok(()),
+        Some(turn_id) => Err(format!(
+            "turn/steer targeted `{turn_id}` instead of active turn `{expected_turn_id}`"
+        )),
+        None => Err("turn/steer response missing turnId".to_string()),
+    }
+}
+
+fn reject_outstanding_steers(
+    queued_steers: VecDeque<CodexSteerRequest>,
+    pending_steers: HashMap<u64, PendingSteer>,
+) {
+    let reason = "active turn finished before turn/steer was accepted";
+    for steer in queued_steers {
+        let _ = steer.response.send(Err(reason.to_string()));
+    }
+    for pending in pending_steers.into_values() {
+        let _ = pending.response.send(Err(reason.to_string()));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1596,6 +1708,36 @@ mod tests {
         assert_eq!(
             params.get("serviceTier").and_then(Value::as_str),
             Some("fast")
+        );
+    }
+
+    #[test]
+    fn builds_turn_steer_params_for_the_active_turn() {
+        assert_eq!(
+            build_turn_steer_params("thread-1", "turn-7", "change direction"),
+            json!({
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "change direction"}],
+                "expectedTurnId": "turn-7",
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_matching_turn_steer_response() {
+        let result = json!({"turnId": "turn-7"});
+
+        assert_eq!(steer_response("turn-7", Some(&result), None), Ok(()));
+    }
+
+    #[test]
+    fn rejects_mismatched_turn_steer_response() {
+        let result = json!({"turnId": "turn-8"});
+
+        assert!(
+            steer_response("turn-7", Some(&result), None)
+                .unwrap_err()
+                .contains("turn-8")
         );
     }
 

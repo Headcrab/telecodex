@@ -114,6 +114,120 @@ fn sample_config(db_path: PathBuf, default_cwd: PathBuf) -> Config {
     }
 }
 
+fn sample_app() -> (App, NamedTempFile) {
+    let db = NamedTempFile::new().unwrap();
+    let config = sample_config(db.path().to_path_buf(), sample_workspace());
+    let store = Store::open(db.path(), &[100], &sample_defaults()).unwrap();
+    let shared = Arc::new(AppShared {
+        config,
+        store,
+        telegram: TelegramClient::new(
+            "test-token".to_string(),
+            "https://api.telegram.org".to_string(),
+        ),
+        codex: CodexRunner::new(PathBuf::from("codex")),
+        bot_username: None,
+        service_user_id: 0,
+        handy_model_dir: None,
+        session_defaults: sample_defaults(),
+        limits_cache: Mutex::new(None),
+        history_page_cache: Mutex::new(HistoryPageCache::default()),
+        pending_approvals: Mutex::new(HashMap::new()),
+        pending_codex_login: Mutex::new(None),
+        codex_login_backoff_until: Mutex::new(None),
+        shutdown: CancellationToken::new(),
+    });
+    (
+        App {
+            shared,
+            workers: Arc::new(Mutex::new(HashMap::new())),
+        },
+        db,
+    )
+}
+
+#[tokio::test]
+async fn sends_plain_text_to_the_active_turn() {
+    let (app, _db) = sample_app();
+    let session_key = SessionKey::new(1, Some(2));
+    let (turn_tx, _turn_rx) = mpsc::unbounded_channel();
+    let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+    app.workers.lock().await.insert(
+        session_key,
+        SessionWorkerHandle {
+            sender: turn_tx,
+            cancel: Arc::new(StdMutex::new(None)),
+            steer: Arc::new(StdMutex::new(Some(ActiveTurnSteerHandle {
+                turn_id: 17,
+                sender: steer_tx,
+            }))),
+        },
+    );
+    let responder = tokio::spawn(async move {
+        let steer = steer_rx.recv().await.expect("steer request");
+        assert_eq!(steer.text, "change direction");
+        steer.response.send(Ok(())).expect("steer response");
+    });
+
+    assert!(
+        app.try_steer_active_turn(session_key, 100, "change direction")
+            .await
+            .unwrap()
+    );
+    responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn falls_back_when_the_active_turn_rejects_steering() {
+    let (app, _db) = sample_app();
+    let session_key = SessionKey::new(1, Some(2));
+    let (turn_tx, _turn_rx) = mpsc::unbounded_channel();
+    let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+    app.workers.lock().await.insert(
+        session_key,
+        SessionWorkerHandle {
+            sender: turn_tx,
+            cancel: Arc::new(StdMutex::new(None)),
+            steer: Arc::new(StdMutex::new(Some(ActiveTurnSteerHandle {
+                turn_id: 17,
+                sender: steer_tx,
+            }))),
+        },
+    );
+    let responder = tokio::spawn(async move {
+        let steer = steer_rx.recv().await.expect("steer request");
+        steer
+            .response
+            .send(Err("turn already completed".to_string()))
+            .expect("steer response");
+    });
+
+    assert!(
+        !app.try_steer_active_turn(session_key, 100, "follow-up")
+            .await
+            .unwrap()
+    );
+    responder.await.unwrap();
+}
+
+#[test]
+fn only_plain_text_messages_are_steer_candidates() {
+    let mut message: Message = serde_json::from_value(serde_json::json!({
+        "message_id": 1,
+        "chat": {"id": 1, "type": "private"},
+        "text": "hello"
+    }))
+    .unwrap();
+
+    assert!(is_text_only_steer_candidate(&message, "hello"));
+    message.document = Some(crate::telegram::Document {
+        file_id: "file-1".to_string(),
+        file_name: Some("notes.txt".to_string()),
+        mime_type: Some("text/plain".to_string()),
+    });
+    assert!(!is_text_only_steer_candidate(&message, "hello"));
+}
+
 #[test]
 fn detects_stale_codex_thread_errors() {
     let error = anyhow::anyhow!("no rollout found for thread id 019abc | code -32600");
