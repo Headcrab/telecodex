@@ -76,10 +76,14 @@ pub enum CodexEventOutcome {
     Approval(CodexApprovalDecision),
 }
 
+/// Result returned to the Telegram routing layer after Codex resolves a steering request.
 pub type CodexSteerResponse = std::result::Result<(), String>;
 
+/// Plain-text input waiting to be appended to an active Codex turn.
 pub struct CodexSteerRequest {
+    /// User text to append to the in-flight turn.
     pub text: String,
+    /// Completion channel resolved after Codex accepts or terminally rejects the request.
     pub response: oneshot::Sender<CodexSteerResponse>,
 }
 
@@ -475,6 +479,7 @@ where
     Ok(summary)
 }
 
+/// Sends one queued steering request and tracks its app-server response by request id.
 async fn send_steer_request(
     process: &mut AppServerProcess,
     thread_id: &str,
@@ -498,6 +503,7 @@ async fn send_steer_request(
     Ok(())
 }
 
+/// Builds the documented `turn/steer` request payload for one active turn.
 fn build_turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value {
     json!({
         "threadId": thread_id,
@@ -506,6 +512,7 @@ fn build_turn_steer_params(thread_id: &str, turn_id: &str, text: &str) -> Value 
     })
 }
 
+/// Validates that Codex accepted the steering request for the expected active turn.
 fn steer_response(
     expected_turn_id: &str,
     result: Option<&Value>,
@@ -526,6 +533,7 @@ fn steer_response(
     }
 }
 
+/// Resolves all unacknowledged steering requests as rejected when turn execution ends.
 fn reject_outstanding_steers(
     queued_steers: VecDeque<CodexSteerRequest>,
     pending_steers: HashMap<u64, PendingSteer>,

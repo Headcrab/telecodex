@@ -1640,6 +1640,8 @@ impl App {
         Ok(())
     }
 
+    /// Attempts to append text to the current turn and only permits queue fallback after a
+    /// terminal rejection or a closed response channel.
     async fn try_steer_active_turn(
         &self,
         session_key: SessionKey,
@@ -1670,8 +1672,8 @@ impl App {
             return Ok(false);
         }
 
-        match tokio::time::timeout(Duration::from_secs(5), response_rx).await {
-            Ok(Ok(Ok(()))) => {
+        match response_rx.await {
+            Ok(Ok(())) => {
                 if let Err(error) = self.shared.store.audit(
                     Some(from_user_id),
                     "turn_steered",
@@ -1685,16 +1687,12 @@ impl App {
                 }
                 Ok(true)
             }
-            Ok(Ok(Err(error))) => {
+            Ok(Err(error)) => {
                 tracing::debug!("active turn rejected steering; queueing as a new turn: {error}");
                 Ok(false)
             }
-            Ok(Err(_)) => {
-                tracing::debug!("active turn steering channel closed; queueing as a new turn");
-                Ok(false)
-            }
             Err(_) => {
-                tracing::warn!("active turn steering timed out; queueing as a new turn");
+                tracing::debug!("active turn steering channel closed; queueing as a new turn");
                 Ok(false)
             }
         }
@@ -1857,6 +1855,7 @@ impl App {
     }
 }
 
+/// Returns whether a Telegram message can safely be appended to an in-flight text turn.
 fn is_text_only_steer_candidate(message: &Message, text: &str) -> bool {
     !text.is_empty()
         && message.photo.is_empty()

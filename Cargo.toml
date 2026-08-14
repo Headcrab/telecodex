@@ -29,3 +29,6 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 transcribe-rs = { version = "0.3.0", features = ["onnx"] }
 uuid = { version = "1.18.1", features = ["serde", "v5", "v7"] }
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["test-util"] }

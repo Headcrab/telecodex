@@ -210,6 +210,43 @@ async fn falls_back_when_the_active_turn_rejects_steering() {
     responder.await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn keeps_steering_pending_past_the_previous_timeout() {
+    let (app, _db) = sample_app();
+    let session_key = SessionKey::new(1, Some(2));
+    let (turn_tx, _turn_rx) = mpsc::unbounded_channel();
+    let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+    app.workers.lock().await.insert(
+        session_key,
+        SessionWorkerHandle {
+            sender: turn_tx,
+            cancel: Arc::new(StdMutex::new(None)),
+            steer: Arc::new(StdMutex::new(Some(ActiveTurnSteerHandle {
+                turn_id: 17,
+                sender: steer_tx,
+            }))),
+        },
+    );
+    let route_app = app.clone();
+    let route = tokio::spawn(async move {
+        route_app
+            .try_steer_active_turn(session_key, 100, "follow-up")
+            .await
+            .unwrap()
+    });
+    let steer = steer_rx.recv().await.expect("steer request");
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert!(!route.is_finished());
+
+    steer
+        .response
+        .send(Err("turn already completed".to_string()))
+        .expect("steer response");
+    assert!(!route.await.unwrap());
+}
+
 #[test]
 fn only_plain_text_messages_are_steer_candidates() {
     let mut message: Message = serde_json::from_value(serde_json::json!({

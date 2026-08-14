@@ -121,7 +121,7 @@ High-level flow:
 
 1. Telegram sends updates through long polling.
 2. Telecodex resolves the active session for the current chat/topic.
-3. Incoming text and attachments are converted into a Codex turn request. While a normal turn is active, new plain-text messages are sent to Codex through `turn/steer`; if steering is rejected, they fall back to the session queue.
+3. Incoming text and attachments are converted into a Codex turn request. While a normal turn is active, new plain-text messages are sent to Codex through `turn/steer`; if steering is unavailable or terminally rejected, they fall back to the session queue.
 4. Codex runs locally in the configured workspace.
 5. Progress is streamed back with private chat drafts or Telegram message edits.
 6. Files produced in the turn output directory are uploaded back to Telegram.
