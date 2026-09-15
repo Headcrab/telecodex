@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub(super) async fn process_turn(
     shared: Arc<AppShared>,
     cancel_slot: Arc<StdMutex<Option<CancellationToken>>>,
+    steer_slot: Arc<StdMutex<Option<ActiveTurnSteerHandle>>>,
     queued: QueuedTurn,
 ) -> Result<()> {
     let session = shared.store.ensure_session(
@@ -101,9 +102,17 @@ pub(super) async fn process_turn(
     let runtime_request =
         enrich_runtime_request_with_context_pressure(&session, runtime_request).await;
 
+    let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+    if queued.request.review_mode.is_none() {
+        *steer_slot.lock().expect("steer mutex poisoned") = Some(ActiveTurnSteerHandle {
+            turn_id,
+            sender: steer_tx,
+        });
+    }
+
     let run_result = shared
         .codex
-        .run_turn(&session, &runtime_request, cancel.clone(), {
+        .run_turn(&session, &runtime_request, cancel.clone(), steer_rx, {
             let sink = sink.clone();
             let shared = shared.clone();
             let approval_cancel = cancel.clone();
@@ -148,6 +157,7 @@ pub(super) async fn process_turn(
         })
         .await;
 
+    *steer_slot.lock().expect("steer mutex poisoned") = None;
     *cancel_slot.lock().expect("cancel mutex poisoned") = None;
     cancel.cancel();
     if let Some(chat_action_task) = chat_action_task.take() {
@@ -1438,8 +1448,6 @@ mod tests {
         assert!(banner.contains("/fast off"));
     }
 
-
-
     #[test]
     fn context_pressure_note_enters_turn_prompt_input() {
         let request = TurnRequest {
@@ -1457,11 +1465,15 @@ mod tests {
             "[CONTEXT PRESSURE] 200K reached; preserve state.",
         );
 
-        assert!(enriched
-            .prompt
-            .starts_with("[CONTEXT PRESSURE] 200K reached; preserve state."));
-        assert!(enriched.prompt.contains("User message:
-Hi. What should we do next?"));
+        assert!(
+            enriched
+                .prompt
+                .starts_with("[CONTEXT PRESSURE] 200K reached; preserve state.")
+        );
+        assert!(enriched.prompt.contains(
+            "User message:
+Hi. What should we do next?"
+        ));
         assert_eq!(
             enriched.runtime_instructions.as_deref(),
             Some("existing runtime instruction")
