@@ -2,29 +2,40 @@ use crate::{
     config::SearchMode,
     limits::{LimitsSnapshot, default_codex_home},
     models::{SessionRecord, TurnRequest},
+    user_input::{NativeRequestId, UserInputDecision, UserInputRequest},
 };
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
     time::{Duration, Instant, sleep_until},
+};
+use tokio_tungstenite::{
+    WebSocketStream, client_async_with_config,
+    tungstenite::{
+        Error as WsError, Message as WsMessage, error::CapacityError, protocol::WebSocketConfig,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct CodexRunner {
     binary: PathBuf,
+    shared_app_server: bool,
 }
 pub struct RunSummary {
     pub codex_thread_id: Option<String>,
@@ -45,8 +56,17 @@ pub struct AvailableModel {
 pub enum CodexEvent {
     Progress(String),
     AssistantText(String),
+    CommentaryCompleted(String),
+    FinalAnswerCompleted(String),
     ThreadStarted(String),
     ApprovalRequest(CodexApprovalRequest),
+    UserInputRequest {
+        id: NativeRequestId,
+        request: UserInputRequest,
+        closed: CancellationToken,
+    },
+    UserInputClosed(NativeRequestId),
+    UserInputAnswered(NativeRequestId),
 }
 
 #[derive(Debug, Clone)]
@@ -70,20 +90,27 @@ pub enum CodexApprovalDecision {
     Cancel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum CodexEventOutcome {
     None,
     Approval(CodexApprovalDecision),
+    UserInput(oneshot::Receiver<UserInputDecision>),
 }
 
-/// Result returned to the Telegram routing layer after Codex resolves a steering request.
-pub type CodexSteerResponse = std::result::Result<(), String>;
+/// Only a definite rejection permits submitting the input as a new turn.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CodexSteerError {
+    Rejected(String),
+    Undetermined(String),
+}
+
+pub type CodexSteerResponse = std::result::Result<(), CodexSteerError>;
 
 /// Plain-text input waiting to be appended to an active Codex turn.
 pub struct CodexSteerRequest {
     /// User text to append to the in-flight turn.
     pub text: String,
-    /// Completion channel resolved after Codex accepts or terminally rejects the request.
+    /// Completion channel reports acceptance, definite rejection or uncertainty.
     pub response: oneshot::Sender<CodexSteerResponse>,
 }
 
@@ -100,11 +127,51 @@ pub struct CommandSpec {
 }
 struct AppServerProcess {
     child: Child,
-    stdin: ChildStdin,
-    stdout_lines: tokio::io::Lines<BufReader<ChildStdout>>,
+    transport: AppServerTransport,
     stderr_buffer: Arc<Mutex<String>>,
     stderr_task: JoinHandle<()>,
     next_id: u64,
+}
+
+struct ProxyIo {
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+}
+
+impl AsyncRead for ProxyIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stdout).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ProxyIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stdin).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stdin).poll_shutdown(cx)
+    }
+}
+
+enum AppServerTransport {
+    Stdio {
+        stdin: ChildStdin,
+        stdout_lines: tokio::io::Lines<BufReader<ChildStdout>>,
+    },
+    Shared(Box<WebSocketStream<ProxyIo>>),
 }
 enum RpcMessage {
     Response {
@@ -117,7 +184,7 @@ enum RpcMessage {
         params: Value,
     },
     ServerRequest {
-        id: u64,
+        id: NativeRequestId,
         method: String,
         params: Value,
     },
@@ -165,7 +232,14 @@ struct SimpleCommandOutput {
 
 impl CodexRunner {
     pub fn new(binary: PathBuf) -> Self {
-        Self { binary }
+        Self {
+            binary,
+            shared_app_server: false,
+        }
+    }
+    pub fn with_shared_app_server(mut self, shared: bool) -> Self {
+        self.shared_app_server = shared;
+        self
     }
     pub fn build_review_command(
         &self,
@@ -232,7 +306,7 @@ impl CodexRunner {
         })
     }
     pub async fn read_rate_limits(&self) -> Result<Option<LimitsSnapshot>> {
-        let mut process = AppServerProcess::spawn(&self.binary).await?;
+        let mut process = AppServerProcess::spawn(&self.binary, self.shared_app_server).await?;
         process.initialize().await?;
         let request_id = process
             .send_request("account/rateLimits/read", Value::Null)
@@ -252,7 +326,7 @@ impl CodexRunner {
             .context("failed to parse rate limits response")
     }
     pub async fn read_models(&self) -> Result<Vec<AvailableModel>> {
-        let mut process = AppServerProcess::spawn(&self.binary).await?;
+        let mut process = AppServerProcess::spawn(&self.binary, self.shared_app_server).await?;
         process.initialize().await?;
         let mut models = Vec::new();
         let mut cursor: Option<String> = None;
@@ -279,6 +353,23 @@ impl CodexRunner {
         }
         Ok(models)
     }
+    pub async fn set_thread_name(&self, thread_id: &str, name: &str) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut process = AppServerProcess::spawn(&self.binary, self.shared_app_server).await?;
+            process.initialize().await?;
+            let id = process
+                .send_request(
+                    "thread/name/set",
+                    json!({"threadId": thread_id, "name": name}),
+                )
+                .await?;
+            process.await_response(id).await?;
+            process.shutdown().await?;
+            Ok(())
+        })
+        .await
+        .context("native rename acknowledgment timed out; its effect is unconfirmed")?
+    }
     pub async fn run_turn<F, Fut>(
         &self,
         session: &SessionRecord,
@@ -296,6 +387,7 @@ impl CodexRunner {
         }
         run_app_server_turn(
             &self.binary,
+            self.shared_app_server,
             session,
             request,
             cancel,
@@ -383,6 +475,7 @@ impl CodexDeviceAuthSession {
 
 async fn run_app_server_turn<F, Fut>(
     binary: &Path,
+    shared_app_server: bool,
     session: &SessionRecord,
     request: &TurnRequest,
     cancel: CancellationToken,
@@ -393,9 +486,36 @@ where
     F: FnMut(CodexEvent) -> Fut,
     Fut: std::future::Future<Output = Result<CodexEventOutcome>>,
 {
-    let mut process = AppServerProcess::spawn(binary).await?;
+    let mut process = AppServerProcess::spawn(binary, shared_app_server).await?;
     process.initialize().await?;
-    let thread_id = process.start_or_resume_thread(session, request).await?;
+    if let Some(mode) = session.collaboration_mode {
+        let id = process
+            .send_request("collaborationMode/list", json!({}))
+            .await?;
+        let presets = process
+            .await_response(id)
+            .await
+            .context("Native collaboration modes unavailable; this turn was not submitted")?;
+        if !presets
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|data| {
+                data.iter()
+                    .any(|p| p.get("mode").and_then(Value::as_str) == Some(mode.as_str()))
+            })
+        {
+            bail!(
+                "Native Codex does not advertise {} mode; this turn was not submitted",
+                mode.as_str()
+            );
+        }
+    }
+    let (thread_id, native_model) = process.start_or_resume_thread(session, request).await?;
+    let mut effective_session = session.clone();
+    effective_session.model = session.model.clone().or(native_model);
+    if session.collaboration_mode.is_some() && effective_session.model.is_none() {
+        bail!("Native mode requires the resolved thread model; this turn was not submitted");
+    }
     let mut summary = RunSummary {
         codex_thread_id: Some(thread_id.clone()),
         assistant_text: String::new(),
@@ -405,7 +525,7 @@ where
     let turn_request_id = process
         .send_request(
             "turn/start",
-            build_turn_start_params(&thread_id, session, request),
+            build_turn_start_params(&thread_id, &effective_session, request),
         )
         .await?;
     let mut active_turn_id: Option<String> = None;
@@ -418,8 +538,38 @@ where
     let mut cancelled = false;
     let mut turn_completed = false;
     let mut assistant_message_completed = false;
+    type PendingInput = Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = (
+                        NativeRequestId,
+                        std::result::Result<UserInputDecision, oneshot::error::RecvError>,
+                    ),
+                > + Send,
+        >,
+    >;
+    let mut pending_inputs = FuturesUnordered::<PendingInput>::new();
+    let mut open_inputs = HashMap::<NativeRequestId, CancellationToken>::new();
+    let mut submitted_inputs = HashSet::new();
     while !turn_completed {
         tokio::select! {
+          Some((id, decision)) = pending_inputs.next(), if !pending_inputs.is_empty() => {
+            if open_inputs.remove(&id).is_some() && !cancelled && !cancel.is_cancelled() {
+                match decision {
+                    Ok(UserInputDecision::Answers(answers)) => {
+                        process.send_result(&id, serde_json::to_value(answers)?).await?;
+                        submitted_inputs.insert(id);
+                    }
+                    Ok(UserInputDecision::Cancel) | Err(_) => {
+                        if let Some(turn_id) = active_turn_id.as_deref() {
+                            interrupt_request_id = Some(process.send_request("turn/interrupt", json!({"threadId":thread_id,"turnId":turn_id})).await?);
+                            cancelled = true;
+                            cancel_deadline = Some(Instant::now()+Duration::from_secs(5));
+                        } else { cancelled = true; break; }
+                    }
+                }
+            }
+          }
           _=cancel.cancelled(), if interrupt_request_id.is_none() => {
             if let Some(turn_id)=active_turn_id.as_deref(){interrupt_request_id=Some(process.send_request("turn/interrupt",json!({"threadId":thread_id,"turnId":turn_id})).await?); cancelled=true; cancel_deadline=Some(Instant::now()+Duration::from_secs(5)); let _ = on_event(CodexEvent::Progress("Interrupt requested.".to_string())).await?;} else {cancelled=true; break;}
           }
@@ -457,8 +607,43 @@ where
                     }
                 }
               }
-              RpcMessage::Notification{method,params}=>{handle_notification(&method,&params,&mut summary,&mut active_turn_id,&mut turn_error,&mut turn_completed,&mut assistant_message_completed,on_event).await?;}
-                RpcMessage::ServerRequest{id,method,params}=>{handle_server_request(&mut process,id,&method,&params,on_event).await?;}
+              RpcMessage::Notification{method,params}=>{
+                if !event_matches_run(&thread_id,active_turn_id.as_deref(),&method,&params,shared_app_server){continue;}
+                if method == "serverRequest/resolved" {
+                    if let Some(id) = params.get("requestId") {
+                        let id: NativeRequestId = serde_json::from_value(id.clone())?;
+                        if submitted_inputs.remove(&id) && !cancelled {
+                            let _=on_event(CodexEvent::UserInputAnswered(id.clone())).await?;
+                        }
+                        if let Some(closed) = open_inputs.remove(&id) {
+                            closed.cancel();
+                            let _ = on_event(CodexEvent::UserInputClosed(id)).await?;
+                        }
+                    }
+                } else {handle_notification(&method,&params,&mut summary,&mut active_turn_id,&mut turn_error,&mut turn_completed,&mut assistant_message_completed,on_event).await?;}
+              }
+              RpcMessage::ServerRequest{id,method,params}=>{
+                if !event_matches_run(&thread_id,active_turn_id.as_deref(),&method,&params,shared_app_server){continue;}
+                if method == "item/tool/requestUserInput" {
+                    if open_inputs.contains_key(&id) || submitted_inputs.contains(&id) { continue; }
+                    let input: UserInputRequest = serde_json::from_value(params)
+                        .context("unsupported native user-input schema")?;
+                    input.validate()?;
+                    if input.thread_id != thread_id || active_turn_id.as_deref() != Some(input.turn_id.as_str()) { bail!("native question does not match the active turn"); }
+                    let closed=CancellationToken::new();
+                    open_inputs.insert(id.clone(),closed.clone());
+                    match on_event(CodexEvent::UserInputRequest{id:id.clone(), request:input,closed:closed.clone()}).await? {
+                        CodexEventOutcome::UserInput(receiver) => pending_inputs.push(Box::pin(async move {
+                            let decision=tokio::select! {
+                                result=receiver=>result,
+                                _=closed.cancelled()=>Ok(UserInputDecision::Cancel),
+                            };
+                            (id,decision)
+                        })),
+                        _ => bail!("native question has no human response channel"),
+                    }
+                } else {handle_server_request(&mut process,id,&method,&params,on_event).await?;}
+              }
             }
             if let Some(turn_id)=active_turn_id.as_deref() {
                 while let Some(steer)=queued_steers.pop_front() {
@@ -468,7 +653,14 @@ where
           }
         }
     }
+    if !turn_completed && !cancelled && turn_error.is_none() {
+        turn_error =
+            Some("native event stream ended before the selected turn completed".to_string());
+    }
     reject_outstanding_steers(queued_steers, pending_steers);
+    for closed in open_inputs.into_values() {
+        closed.cancel();
+    }
     summary.stderr_text = process.shutdown().await?;
     if let Some(error) = turn_error {
         bail!("{error}");
@@ -477,6 +669,39 @@ where
         bail!("codex turn cancelled");
     }
     Ok(summary)
+}
+
+/// Route only the selected thread and its current turn on a shared native transport.
+/// Legacy private stdio transports may omit scopes, but explicit mismatches are rejected.
+fn event_matches_run(
+    thread_id: &str,
+    active_turn_id: Option<&str>,
+    method: &str,
+    params: &Value,
+    require_scope: bool,
+) -> bool {
+    let event_thread = params.get("threadId").and_then(Value::as_str).or_else(|| {
+        params
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+    });
+    match event_thread {
+        Some(id) if id != thread_id => return false,
+        None if require_scope => return false,
+        _ => {}
+    }
+    let event_turn = params.get("turnId").and_then(Value::as_str).or_else(|| {
+        params
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+    });
+    match (event_turn, active_turn_id) {
+        (Some(id), Some(active)) => id == active,
+        (Some(_), None) => method == "turn/started",
+        (None, _) => !require_scope || !method.starts_with("turn/") && !method.starts_with("item/"),
+    }
 }
 
 /// Sends one queued steering request and tracks its app-server response by request id.
@@ -519,31 +744,42 @@ fn steer_response(
     error: Option<&RpcError>,
 ) -> CodexSteerResponse {
     if let Some(error) = error {
-        return Err(format_rpc_error(error));
+        let message = format_rpc_error(error);
+        return Err(if matches!(error.code, Some(-32602..=-32600)) {
+            CodexSteerError::Rejected(message)
+        } else {
+            CodexSteerError::Undetermined(message)
+        });
     }
     match result
         .and_then(|value| value.get("turnId"))
         .and_then(Value::as_str)
     {
         Some(turn_id) if turn_id == expected_turn_id => Ok(()),
-        Some(turn_id) => Err(format!(
+        Some(turn_id) => Err(CodexSteerError::Undetermined(format!(
             "turn/steer targeted `{turn_id}` instead of active turn `{expected_turn_id}`"
+        ))),
+        None => Err(CodexSteerError::Undetermined(
+            "turn/steer response missing turnId".to_string(),
         )),
-        None => Err("turn/steer response missing turnId".to_string()),
     }
 }
 
-/// Resolves all unacknowledged steering requests as rejected when turn execution ends.
+/// Distinguishes never-sent input from input whose native acceptance is unknown.
 fn reject_outstanding_steers(
     queued_steers: VecDeque<CodexSteerRequest>,
     pending_steers: HashMap<u64, PendingSteer>,
 ) {
     let reason = "active turn finished before turn/steer was accepted";
     for steer in queued_steers {
-        let _ = steer.response.send(Err(reason.to_string()));
+        let _ = steer
+            .response
+            .send(Err(CodexSteerError::Rejected(reason.to_string())));
     }
     for pending in pending_steers.into_values() {
-        let _ = pending.response.send(Err(reason.to_string()));
+        let _ = pending
+            .response
+            .send(Err(CodexSteerError::Undetermined(reason.to_string())));
     }
 }
 
@@ -626,6 +862,10 @@ where
         }
         "item/started" => {
             if let Some(item) = params.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                    summary.assistant_text.clear();
+                    *assistant_message_completed = false;
+                }
                 if item.get("type").and_then(Value::as_str) == Some("commandExecution") {
                     let command = item
                         .get("command")
@@ -644,13 +884,20 @@ where
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
+                        if text.trim().is_empty() {
+                            // A blank item cannot qualify assistant output or idle completion.
+                            return Ok(());
+                        }
                         *assistant_message_completed = true;
                         summary.assistant_text = text.clone();
-                        let _ = on_event(CodexEvent::AssistantText(text)).await?;
-                        if item.get("phase").and_then(Value::as_str) == Some("final_answer") {
-                            *active_turn_id = None;
-                            *turn_completed = true;
-                        }
+                        let event = match item.get("phase").and_then(Value::as_str) {
+                            Some("commentary") => CodexEvent::CommentaryCompleted(text),
+                            Some("final_answer") => CodexEvent::FinalAnswerCompleted(text),
+                            _ => CodexEvent::AssistantText(text),
+                        };
+                        let _ = on_event(event).await?;
+                        // An answer can precede more work, steering or lifecycle hooks.
+                        // Keep listening until the owning native turn really ends.
                     }
                     Some("commandExecution") => {
                         let status = item
@@ -685,7 +932,7 @@ where
 
 async fn handle_server_request<F, Fut>(
     process: &mut AppServerProcess,
-    id: u64,
+    id: NativeRequestId,
     method: &str,
     params: &Value,
     on_event: &mut F,
@@ -700,7 +947,7 @@ where
             let outcome = on_event(CodexEvent::ApprovalRequest(request)).await?;
             process
                 .send_result(
-                    id,
+                    &id,
                     json!({"decision": approval_decision_value(outcome_to_approval_decision(outcome))}),
                 )
                 .await?;
@@ -710,17 +957,10 @@ where
             let outcome = on_event(CodexEvent::ApprovalRequest(request)).await?;
             process
                 .send_result(
-                    id,
+                    &id,
                     json!({"decision": approval_decision_value(outcome_to_approval_decision(outcome))}),
                 )
                 .await?;
-        }
-        "item/tool/requestUserInput" => {
-            process.send_result(id, json!({"answers":{}})).await?;
-            let _ = on_event(CodexEvent::Progress(
-                "Tool requested user input, but Telegram replies are not wired yet.".to_string(),
-            ))
-            .await?;
         }
         _ => {
             bail!("unsupported app-server server request `{method}`");
@@ -775,7 +1015,7 @@ where
     loop {
         tokio::select! {
           _=cancel.cancelled()=>{terminate_child(&mut child).await; let _=stderr_task.await; bail!("codex turn cancelled");}
-          next_line=stdout_lines.next_line()=>{match next_line.context("reading codex stdout failed")?{Some(line)=>{if let Some(event)=parse_exec_event(&line)?{match &event{CodexEvent::ThreadStarted(thread_id)=>summary.codex_thread_id=Some(thread_id.clone()),CodexEvent::AssistantText(text)=>summary.assistant_text=text.clone(),CodexEvent::Progress(_)|CodexEvent::ApprovalRequest(_)=>{}} let _ = on_event(event).await?;}},None=>break,}}
+          next_line=stdout_lines.next_line()=>{match next_line.context("reading codex stdout failed")?{Some(line)=>{if let Some(event)=parse_exec_event(&line)?{match &event{CodexEvent::ThreadStarted(thread_id)=>summary.codex_thread_id=Some(thread_id.clone()),CodexEvent::AssistantText(text)|CodexEvent::CommentaryCompleted(text)|CodexEvent::FinalAnswerCompleted(text)=>summary.assistant_text=text.clone(),CodexEvent::Progress(_)|CodexEvent::ApprovalRequest(_)|CodexEvent::UserInputRequest { .. }|CodexEvent::UserInputClosed(_)|CodexEvent::UserInputAnswered(_)=>{}} let _ = on_event(event).await?;}},None=>break,}}
         }
     }
     let status = child.wait().await.context("waiting for codex failed")?;
@@ -857,8 +1097,10 @@ fn build_thread_request(session: &SessionRecord, request: &TurnRequest) -> (&'st
         session.session_prompt.as_deref(),
         request.runtime_instructions.as_deref(),
     );
-    let params = json!({"threadId":session.codex_thread_id,"model":session.model,"cwd":sanitize_arg_path(&session.cwd),"approvalPolicy":session.approval_policy,"sandbox":session.sandbox_mode,"config":build_config_overrides(session.search_mode),"serviceName":"telecodex","developerInstructions":developer_instructions});
+    let mut params = json!({"threadId":session.codex_thread_id,"model":session.model,"cwd":sanitize_arg_path(&session.cwd),"approvalPolicy":session.approval_policy,"sandbox":session.sandbox_mode,"config":build_config_overrides(session.search_mode),"serviceName":"telecodex","developerInstructions":developer_instructions});
     if session.codex_thread_id.is_some() {
+        // The bridge needs metadata and live events, not a copy of persisted turns.
+        params["excludeTurns"] = Value::Bool(true);
         ("thread/resume", params)
     } else {
         ("thread/start", params)
@@ -881,7 +1123,10 @@ fn build_turn_start_params(
         .as_deref()
         .map(Value::from)
         .unwrap_or(Value::Null);
-    json!({"threadId":thread_id,"input":input,"cwd":sanitize_arg_path(&session.cwd),"approvalPolicy":session.approval_policy,"sandboxPolicy":build_sandbox_policy(session),"model":session.model,"effort":session.reasoning_effort,"summary":Value::Null,"serviceTier":service_tier,"outputSchema":Value::Null,"personality":Value::Null,"collaborationMode":Value::Null,"config":build_config_overrides(effective_search_mode)})
+    let collaboration = session.collaboration_mode.map(|mode| json!({
+        "mode":mode.as_str(), "settings":{"model":session.model,"reasoning_effort":session.reasoning_effort,"developer_instructions":Value::Null}
+    }));
+    json!({"threadId":thread_id,"input":input,"cwd":sanitize_arg_path(&session.cwd),"approvalPolicy":session.approval_policy,"sandboxPolicy":build_sandbox_policy(session),"model":session.model,"effort":session.reasoning_effort,"summary":Value::Null,"serviceTier":service_tier,"outputSchema":Value::Null,"personality":Value::Null,"collaborationMode":collaboration,"config":build_config_overrides(effective_search_mode)})
 }
 
 fn build_sandbox_policy(session: &SessionRecord) -> Value {
@@ -1195,7 +1440,7 @@ fn approval_decision_value(decision: CodexApprovalDecision) -> &'static str {
 fn outcome_to_approval_decision(outcome: CodexEventOutcome) -> CodexApprovalDecision {
     match outcome {
         CodexEventOutcome::Approval(decision) => decision,
-        CodexEventOutcome::None => CodexApprovalDecision::Decline,
+        CodexEventOutcome::None | CodexEventOutcome::UserInput(_) => CodexApprovalDecision::Decline,
     }
 }
 
@@ -1252,10 +1497,22 @@ fn push_common_config_args(
         args.push(model.clone());
     }
 }
+// Resume responses may contain a long thread history in one frame. Keep the
+// existing 64 MiB message bound, and permit one frame up to that same bound.
+fn native_proxy_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(64 * 1024 * 1024))
+        .max_frame_size(Some(64 * 1024 * 1024))
+}
+
 impl AppServerProcess {
-    async fn spawn(binary: &Path) -> Result<Self> {
-        let spec = build_app_server_command(binary);
+    async fn spawn(binary: &Path, shared: bool) -> Result<Self> {
+        let mut spec = build_app_server_command(binary);
+        if shared {
+            spec.args.push("proxy".to_string());
+        }
         let mut command = spawnable_command(&spec);
+        command.kill_on_drop(true);
         let mut child = command.spawn().with_context(|| {
             format!(
                 "failed to spawn codex app-server: {} {}",
@@ -1288,18 +1545,47 @@ impl AppServerProcess {
                 tracing::warn!("codex stderr: {line}");
             }
         });
+        let transport = if shared {
+            let handshake = tokio::time::timeout(
+                Duration::from_secs(10),
+                client_async_with_config(
+                    "ws://localhost/",
+                    ProxyIo { stdin, stdout },
+                    Some(native_proxy_websocket_config()),
+                ),
+            )
+            .await;
+            match handshake {
+                Ok(Ok((socket, _response))) => AppServerTransport::Shared(Box::new(socket)),
+                outcome => {
+                    terminate_child(&mut child).await;
+                    stderr_task.abort();
+                    match outcome {
+                        Err(_) => bail!("native Codex proxy WebSocket handshake timed out"),
+                        Ok(Err(_)) => bail!("native Codex proxy WebSocket handshake failed"),
+                        Ok(Ok(_)) => unreachable!(),
+                    }
+                }
+            }
+        } else {
+            AppServerTransport::Stdio {
+                stdin,
+                stdout_lines: BufReader::new(stdout).lines(),
+            }
+        };
         Ok(Self {
             child,
-            stdin,
-            stdout_lines: BufReader::new(stdout).lines(),
+            transport,
             stderr_buffer,
             stderr_task,
             next_id: 1,
         })
     }
     async fn initialize(&mut self) -> Result<()> {
-        let request_id=self.send_request("initialize",json!({"clientInfo":{"name":"telecodex","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}})).await?;
-        let _ = self.await_response(request_id).await?;
+        let request_id=self.send_request("initialize",json!({"clientInfo":{"name":"telecodex","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
+        let _ = tokio::time::timeout(Duration::from_secs(15), self.await_response(request_id))
+            .await
+            .context("Codex App Server initialize timed out")??;
         self.send_notification("initialized").await?;
         Ok(())
     }
@@ -1307,16 +1593,21 @@ impl AppServerProcess {
         &mut self,
         session: &SessionRecord,
         request: &TurnRequest,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<String>)> {
         let (method, params) = build_thread_request(session, request);
         let request_id = self.send_request(method, params).await?;
         let response = self.await_response(request_id).await?;
-        response
+        let thread_id = response
             .get("thread")
             .and_then(|thread| thread.get("id"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| anyhow!("app-server `{method}` response missing thread id"))
+            .ok_or_else(|| anyhow!("app-server `{method}` response missing thread id"))?;
+        let model = response
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok((thread_id, model))
     }
     async fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
         let id = self.next_id;
@@ -1328,7 +1619,7 @@ impl AppServerProcess {
     async fn send_notification(&mut self, method: &str) -> Result<()> {
         self.write_line(&json!({"method":method})).await
     }
-    async fn send_result(&mut self, id: u64, result: Value) -> Result<()> {
+    async fn send_result(&mut self, id: &NativeRequestId, result: Value) -> Result<()> {
         self.write_line(&json!({"id":id,"result":result})).await
     }
     async fn await_response(&mut self, expected_id: u64) -> Result<Value> {
@@ -1349,34 +1640,69 @@ impl AppServerProcess {
                 RpcMessage::Notification { .. } => {}
                 RpcMessage::ServerRequest { id, method, .. } => {
                     bail!(
-                        "unexpected server request `{method}` before response {expected_id} (request id {id})"
+                        "unexpected server request `{method}` before response {expected_id} (request id {id:?})"
                     );
                 }
             }
         }
     }
     async fn next_message(&mut self) -> Result<Option<RpcMessage>> {
-        let Some(line) = self
-            .stdout_lines
-            .next_line()
-            .await
-            .context("reading app-server stdout failed")?
-        else {
-            return Ok(None);
+        let line = match &mut self.transport {
+            AppServerTransport::Stdio { stdout_lines, .. } => {
+                let Some(line) = stdout_lines
+                    .next_line()
+                    .await
+                    .context("reading app-server stdout failed")?
+                else {
+                    return Ok(None);
+                };
+                line
+            }
+            AppServerTransport::Shared(socket) => loop {
+                match socket.next().await {
+                    Some(Ok(WsMessage::Text(text))) => break text.to_string(),
+                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                    Some(Ok(WsMessage::Close(_))) | None => return Ok(None),
+                    Some(Ok(_)) => bail!("native Codex proxy returned an unsupported frame"),
+                    Some(Err(WsError::Capacity(CapacityError::MessageTooLong {
+                        size,
+                        max_size,
+                    }))) => {
+                        bail!(
+                            "native Codex proxy WebSocket receive limit exceeded: {size} bytes > {max_size} bytes"
+                        );
+                    }
+                    Some(Err(WsError::Io(error))) => {
+                        bail!(
+                            "native Codex proxy WebSocket read failed (I/O: {:?})",
+                            error.kind()
+                        );
+                    }
+                    Some(Err(_)) => bail!("native Codex proxy WebSocket read failed"),
+                }
+            },
         };
         parse_rpc_message(&line)
     }
     async fn write_line(&mut self, value: &Value) -> Result<()> {
-        let mut line = serde_json::to_vec(value)?;
-        line.push(b'\n');
-        self.stdin
-            .write_all(&line)
-            .await
-            .context("writing app-server request failed")?;
-        self.stdin
-            .flush()
-            .await
-            .context("flushing app-server stdin failed")
+        match &mut self.transport {
+            AppServerTransport::Stdio { stdin, .. } => {
+                let mut line = serde_json::to_vec(value)?;
+                line.push(b'\n');
+                stdin
+                    .write_all(&line)
+                    .await
+                    .context("writing app-server request failed")?;
+                stdin
+                    .flush()
+                    .await
+                    .context("flushing app-server stdin failed")
+            }
+            AppServerTransport::Shared(socket) => socket
+                .send(WsMessage::Text(serde_json::to_string(value)?.into()))
+                .await
+                .map_err(|_| anyhow!("native Codex proxy WebSocket write failed")),
+        }
     }
     async fn shutdown(mut self) -> Result<String> {
         terminate_child(&mut self.child).await;
@@ -1391,6 +1717,39 @@ impl AppServerProcess {
     }
 }
 
+/// Explicit owner-run native attachment qualification; never starts inference.
+pub async fn probe_native(binary: &Path, cwd: &Path, create_threads: bool) -> Result<Value> {
+    let mut process = AppServerProcess::spawn(binary, true).await?;
+    let qualification = async {
+        process.initialize().await?;
+        let request_id = process.send_request("skills/list", json!({"cwds": [cwd], "forceReload": true})).await?;
+        let skills = process.await_response(request_id).await?;
+        let mut names = BTreeSet::new();
+        let mut errors = 0;
+        for surface in skills["data"].as_array().into_iter().flatten() {
+            errors += surface["errors"].as_array().map_or(0, Vec::len);
+            for skill in surface["skills"].as_array().into_iter().flatten() {
+                if skill["enabled"].as_bool().unwrap_or(true) {
+                    if let Some(name) = skill["name"].as_str() { names.insert(name.to_string()); }
+                }
+            }
+        }
+        let mut threads = Vec::new();
+        if create_threads {
+            for _ in 0..2 {
+                let id = process.send_request("thread/start", json!({"cwd": cwd, "approvalPolicy": "never", "sandbox": "read-only", "serviceName": "telecodex-qualification", "ephemeral": false})).await?;
+                let started = process.await_response(id).await?;
+                let thread = started["thread"]["id"].as_str().context("native probe thread missing")?.to_string();
+                threads.push(thread);
+            }
+            if threads[0] == threads[1] { bail!("native probe contexts were not distinct"); }
+        }
+        Ok(json!({"proxy": "existing native control socket, WebSocket framing", "skills_force_reload": true, "enabled_skills": names, "skill_errors": errors, "model_turns_started": 0, "created_probe_threads": threads, "thread_persistence_qualified": false, "note": "Empty contexts have no persisted rollout history; resume acceptance requires a first native turn"}))
+    }.await;
+    process.shutdown().await?;
+    qualification
+}
+
 fn parse_rpc_message(line: &str) -> Result<Option<RpcMessage>> {
     let value: Value = match serde_json::from_str(line) {
         Ok(value) => value,
@@ -1403,6 +1762,13 @@ fn parse_rpc_message(line: &str) -> Result<Option<RpcMessage>> {
         .get("method")
         .and_then(Value::as_str)
         .map(str::to_string);
+    if let (Some(method), Some(id)) = (&method, value.get("id")) {
+        return Ok(Some(RpcMessage::ServerRequest {
+            id: serde_json::from_value(id.clone()).context("invalid native server request ID")?,
+            method: method.clone(),
+            params: value.get("params").cloned().unwrap_or(Value::Null),
+        }));
+    }
     let id = value.get("id").and_then(Value::as_u64);
     let params = value.get("params").cloned().unwrap_or(Value::Null);
     let result = value.get("result").cloned();
@@ -1412,7 +1778,7 @@ fn parse_rpc_message(line: &str) -> Result<Option<RpcMessage>> {
         .map(serde_json::from_value)
         .transpose()?;
     Ok(Some(match (method, id, result, error) {
-        (Some(method), Some(id), _, _) => RpcMessage::ServerRequest { id, method, params },
+        (Some(_), Some(_), _, _) => unreachable!(),
         (Some(method), None, _, _) => RpcMessage::Notification { method, params },
         (None, Some(id), result, error) => RpcMessage::Response { id, result, error },
         _ => return Ok(None),
@@ -1559,6 +1925,184 @@ struct ExecItem {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn proxy_fixture(root: &Path, port: u16) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("codex-proxy");
+        fs::write(
+            &path,
+            format!(
+                r#"#!/usr/bin/env python3
+import os,socket,sys,threading
+if sys.argv[1:] != ['app-server','proxy']: sys.exit(7)
+s=socket.create_connection(('127.0.0.1',{port}), timeout=3)
+def upload():
+    while True:
+        data=os.read(0,8192)
+        if not data: break
+        s.sendall(data)
+threading.Thread(target=upload,daemon=True).start()
+while True:
+    data=s.recv(8192)
+    if not data: break
+    os.write(1,data)
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_proxy_handshake_and_rpc_use_real_websocket_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let binary = proxy_fixture(root.path(), listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let init: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(init["method"], "initialize");
+            socket
+                .send(WsMessage::Text(
+                    json!({"id": init["id"], "result": {}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            let notification: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(notification["method"], "initialized");
+            let request: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "skills/list");
+            assert_eq!(request["params"]["forceReload"], true);
+            socket
+                .send(WsMessage::Text(
+                    json!({"id": request["id"], "result": {"data": []}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let mut process = AppServerProcess::spawn(&binary, true).await.unwrap();
+        process.initialize().await.unwrap();
+        let id = process
+            .send_request("skills/list", json!({"forceReload": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            process.await_response(id).await.unwrap(),
+            json!({"data": []})
+        );
+        process.shutdown().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_proxy_receives_history_above_default_frame_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let binary = proxy_fixture(root.path(), listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "thread/read");
+            socket
+                .send(WsMessage::Text(
+                    json!({
+                        "id": request["id"],
+                        "result": {"history": "x".repeat(17 * 1024 * 1024)}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let mut process = AppServerProcess::spawn(&binary, true).await.unwrap();
+        let id = process
+            .send_request(
+                "thread/read",
+                json!({"threadId":"fixture-thread","includeTurns":true}),
+            )
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), process.await_response(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["history"].as_str().unwrap().len(), 17 * 1024 * 1024);
+        process.shutdown().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_proxy_rejects_frame_above_bounded_receive_limit() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut socket = WebSocketStream::from_raw_socket(
+            client,
+            Role::Client,
+            Some(native_proxy_websocket_config()),
+        )
+        .await;
+        let size = 64 * 1024 * 1024 + 1;
+        let mut header = vec![0x81, 127];
+        header.extend_from_slice(&(size as u64).to_be_bytes());
+        server.write_all(&header).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(error, WsError::Capacity(CapacityError::MessageTooLong { size: actual, max_size }) if actual == size && max_size == 64 * 1024 * 1024)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_native_proxy_handshake_is_bounded_and_does_not_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let binary = proxy_fixture(root.path(), listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"HTTP/1.1 400 Refused\r\nContent-Length: 21\r\nConnection: close\r\n\r\nSYNTHETIC_PRIVATE_KEY").await.unwrap();
+            drop(stream);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            AppServerProcess::spawn(&binary, true),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "native Codex proxy WebSocket handshake failed"
+        );
+        assert!(!format!("{error:?}").contains("SYNTHETIC_PRIVATE_KEY"));
+        server.await.unwrap();
+    }
+
     fn sample_workspace() -> PathBuf {
         std::env::temp_dir()
             .join("telecodex-tests")
@@ -1584,6 +2128,7 @@ mod tests {
             model: Some("gpt-5.4".to_string()),
             reasoning_effort: None,
             service_tier: None,
+            collaboration_mode: None,
             session_prompt: None,
             sandbox_mode: mode.to_string(),
             approval_policy: "never".to_string(),
@@ -1742,11 +2287,8 @@ mod tests {
     fn rejects_mismatched_turn_steer_response() {
         let result = json!({"turnId": "turn-8"});
 
-        assert!(
-            steer_response("turn-7", Some(&result), None)
-                .unwrap_err()
-                .contains("turn-8")
-        );
+        assert!(matches!(steer_response("turn-7", Some(&result), None),
+            Err(CodexSteerError::Undetermined(message)) if message.contains("turn-8")));
     }
 
     #[test]
@@ -1899,7 +2441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completes_turn_on_final_answer_item_completed() {
+    async fn final_answer_is_published_without_closing_the_native_turn() {
         let mut summary = RunSummary {
             codex_thread_id: None,
             assistant_text: String::new(),
@@ -1932,9 +2474,67 @@ mod tests {
 
         assert_eq!(summary.assistant_text, "На связи.");
         assert!(assistant_message_completed);
-        assert!(turn_completed);
-        assert!(active_turn_id.is_none());
+        assert!(!turn_completed);
+        assert_eq!(active_turn_id.as_deref(), Some("turn-1"));
         assert!(turn_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn commentary_is_committed_separately_and_next_message_deltas_start_empty() {
+        let mut summary = RunSummary {
+            codex_thread_id: None,
+            assistant_text: String::new(),
+            stderr_text: String::new(),
+        };
+        let mut active_turn_id = Some("turn-1".to_string());
+        let mut turn_error = None;
+        let mut turn_completed = false;
+        let mut assistant_message_completed = false;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let mut on_event = move |event| {
+            observed.lock().unwrap().push(event);
+            async { Ok(CodexEventOutcome::None) }
+        };
+        for (method, params) in [
+            ("item/started", json!({"item":{"type":"agentMessage"}})),
+            ("item/agentMessage/delta", json!({"delta":"Progress."})),
+            (
+                "item/completed",
+                json!({"item":{"type":"agentMessage",
+                "text":"Progress.","phase":"commentary"}}),
+            ),
+            ("item/started", json!({"item":{"type":"agentMessage"}})),
+            ("item/agentMessage/delta", json!({"delta":"Final "})),
+            ("item/agentMessage/delta", json!({"delta":"answer."})),
+            (
+                "item/completed",
+                json!({"item":{"type":"agentMessage",
+                "text":"Final answer.","phase":"final_answer"}}),
+            ),
+        ] {
+            handle_notification(
+                method,
+                &params,
+                &mut summary,
+                &mut active_turn_id,
+                &mut turn_error,
+                &mut turn_completed,
+                &mut assistant_message_completed,
+                &mut on_event,
+            )
+            .await
+            .unwrap();
+        }
+        let events = events.lock().unwrap();
+        assert!(matches!(&events[1], CodexEvent::CommentaryCompleted(text) if text == "Progress."));
+        assert!(matches!(&events[2], CodexEvent::AssistantText(text) if text == "Final "));
+        assert!(matches!(&events[3], CodexEvent::AssistantText(text) if text == "Final answer."));
+        assert!(
+            matches!(&events[4], CodexEvent::FinalAnswerCompleted(text) if text == "Final answer.")
+        );
+        assert_eq!(summary.assistant_text, "Final answer.");
+        assert!(!turn_completed);
     }
 
     #[tokio::test]

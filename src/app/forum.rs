@@ -98,6 +98,14 @@ impl App {
         if session.key.thread_id <= 0 {
             return Ok(false);
         }
+        if self
+            .shared
+            .store
+            .explicit_session_title(session.key)?
+            .is_some()
+        {
+            return Ok(true);
+        }
         self.shared
             .store
             .set_session_cwd(session.key, &environment.cwd)?;

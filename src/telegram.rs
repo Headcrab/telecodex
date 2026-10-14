@@ -81,6 +81,36 @@ impl TelegramClient {
             .await
     }
 
+    /// Open Telegram's reply composer while retaining the same delivery limits.
+    pub async fn send_force_reply(&self, message: SendMessage) -> Result<Message> {
+        if message.reply_markup.is_some() {
+            bail!("ForceReply cannot be combined with an inline keyboard");
+        }
+        #[derive(Serialize)]
+        struct ForceReply {
+            force_reply: bool,
+            input_field_placeholder: &'static str,
+        }
+        #[derive(Serialize)]
+        struct Request<'a> {
+            #[serde(flatten)]
+            message: &'a SendMessage,
+            reply_markup: ForceReply,
+        }
+        self.post_outbound(
+            message.chat_id,
+            "sendMessage",
+            Some(&Request {
+                message: &message,
+                reply_markup: ForceReply {
+                    force_reply: true,
+                    input_field_placeholder: "Your answer",
+                },
+            }),
+        )
+        .await
+    }
+
     pub async fn send_chat_action(
         &self,
         chat_id: i64,
@@ -334,12 +364,17 @@ impl TelegramClient {
             .timeout(TELEGRAM_DOWNLOAD_TIMEOUT)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("telegram getFile download failed")?;
         let status = response.status();
         if !status.is_success() {
             bail!("telegram file download failed with status {status}");
         }
-        Ok(response.bytes().await?.to_vec())
+        Ok(response
+            .bytes()
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .to_vec())
     }
 
     async fn post<T, R>(&self, method: &str, payload: Option<&T>) -> Result<R>
@@ -389,11 +424,13 @@ impl TelegramClient {
         let response = request
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("telegram {method} request failed"))?;
         let status = response.status();
         let body = response
             .text()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("telegram {method} response body failed"))?;
 
         if !status.is_success() {
@@ -404,7 +441,8 @@ impl TelegramClient {
                         status,
                         description: parsed
                             .description
-                            .unwrap_or_else(|| "telegram api error".to_string()),
+                            .unwrap_or_else(|| "telegram api error".to_string())
+                            .replace(&self.token, "[redacted]"),
                         retry_after: parameters.retry_after,
                     }
                     .into());
@@ -412,20 +450,23 @@ impl TelegramClient {
             }
             return Err(TelegramError {
                 status,
-                description: body,
+                description: body.replace(&self.token, "[redacted]"),
                 retry_after: None,
             }
             .into());
         }
 
+        // Serde's error can quote a server-controlled value, including a reflected token.
+        // Retain the method diagnostic without retaining the raw decoding cause.
         let parsed: ApiResponse<R> = serde_json::from_str(&body)
-            .with_context(|| format!("telegram {method} JSON decode failed"))?;
+            .map_err(|_| anyhow::anyhow!("telegram {method} JSON decode failed"))?;
         if !parsed.ok {
             return Err(TelegramError {
                 status,
                 description: parsed
                     .description
-                    .unwrap_or_else(|| "telegram api error".to_string()),
+                    .unwrap_or_else(|| "telegram api error".to_string())
+                    .replace(&self.token, "[redacted]"),
                 retry_after: parsed
                     .parameters
                     .and_then(|parameters| parameters.retry_after),
@@ -480,11 +521,13 @@ impl TelegramClient {
             .timeout(TELEGRAM_UPLOAD_TIMEOUT)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("telegram {method} multipart request failed"))?;
         let status = response.status();
         let body = response
             .text()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("telegram {method} response body failed"))?;
 
         if !status.is_success() {
@@ -498,7 +541,8 @@ impl TelegramClient {
                         status,
                         description: parsed
                             .description
-                            .unwrap_or_else(|| "telegram api error".to_string()),
+                            .unwrap_or_else(|| "telegram api error".to_string())
+                            .replace(&self.token, "[redacted]"),
                         retry_after: parameters.retry_after,
                     }
                     .into());
@@ -506,14 +550,14 @@ impl TelegramClient {
             }
             return Err(TelegramError {
                 status,
-                description: body,
+                description: body.replace(&self.token, "[redacted]"),
                 retry_after: None,
             }
             .into());
         }
 
         let parsed: ApiResponse<Message> = serde_json::from_str(&body)
-            .with_context(|| format!("telegram {method} JSON decode failed"))?;
+            .map_err(|_| anyhow::anyhow!("telegram {method} JSON decode failed"))?;
         if !parsed.ok {
             if let Some(retry_after) = parsed
                 .parameters
@@ -526,7 +570,8 @@ impl TelegramClient {
                 status,
                 description: parsed
                     .description
-                    .unwrap_or_else(|| "telegram api error".to_string()),
+                    .unwrap_or_else(|| "telegram api error".to_string())
+                    .replace(&self.token, "[redacted]"),
                 retry_after: parsed
                     .parameters
                     .and_then(|parameters| parameters.retry_after),
@@ -663,20 +708,21 @@ struct ResponseParameters {
     retry_after: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
     pub callback_query: Option<CallbackQuery>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub message_id: i64,
     pub message_thread_id: Option<i64>,
     pub from: Option<User>,
     pub chat: Chat,
     pub text: Option<String>,
+    pub reply_to_message: Option<ReplyMessage>,
     pub caption: Option<String>,
     #[serde(default)]
     pub photo: Vec<PhotoSize>,
@@ -684,9 +730,22 @@ pub struct Message {
     pub audio: Option<Audio>,
     pub voice: Option<Voice>,
     pub video: Option<Video>,
+    pub forum_topic_edited: Option<ForumTopicEdited>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForumTopicEdited {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyMessage {
+    pub message_id: i64,
+    pub from: Option<User>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallbackQuery {
     pub id: String,
     pub from: User,
@@ -694,16 +753,17 @@ pub struct CallbackQuery {
     pub data: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: i64,
     pub is_bot: bool,
     #[allow(dead_code)]
     pub first_name: String,
     pub username: Option<String>,
+    pub has_topics_enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chat {
     pub id: i64,
     #[serde(rename = "type")]
@@ -713,7 +773,7 @@ pub struct Chat {
     pub title: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhotoSize {
     pub file_id: String,
     pub width: i64,
@@ -721,39 +781,39 @@ pub struct PhotoSize {
     pub file_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub file_id: String,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Audio {
     pub file_id: String,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Voice {
     pub file_id: String,
     pub mime_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Video {
     pub file_id: String,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct File {
     pub file_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForumTopic {
     pub message_thread_id: i64,
     pub name: String,
@@ -1038,8 +1098,124 @@ mod rate_limit_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn serve_api(
+        replies: Vec<(u16, serde_json::Value)>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<Vec<(String, serde_json::Value)>>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, value) in replies {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing HTTP request");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test HTTP accept: {error}"),
+                    }
+                };
+                // macOS inherits the listener's nonblocking flag on accepted sockets.
+                // The fixture uses bounded blocking reads on every supported platform.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let split = loop {
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).unwrap();
+                    bytes.push(byte[0]);
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break bytes.len();
+                    }
+                };
+                let header = String::from_utf8(bytes).unwrap();
+                let length: usize = header
+                    .lines()
+                    .find_map(|line| {
+                        let (key, val) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| val.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                assert!(length <= 8192);
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(split, header.len());
+                requests.push((
+                    header.lines().next().unwrap().to_string(),
+                    if body.is_empty() || header.contains("multipart/form-data") {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::from_slice(&body).unwrap()
+                    },
+                ));
+                let body = value.to_string();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (address, worker)
+    }
+
+    #[tokio::test]
+    async fn actual_api_and_network_failures_never_expose_the_token() {
+        let token = "synthetic-secret-token";
+        let (api, server) = serve_api(vec![(
+            400,
+            serde_json::json!({
+                "ok": false, "description": format!("reflected bot{token}")
+            }),
+        )]);
+        let client = TelegramClient::new(token.to_string(), api.clone());
+        let error = client.get_me().await.unwrap_err();
+        assert!(!format!("{error:#}").contains(token));
+        assert!(format!("{error:#}").contains("[redacted]"));
+        assert!(server.join().unwrap()[0].0.contains("/getMe"));
+        let error = client.get_me().await.unwrap_err();
+        assert!(!format!("{error:#}").contains(token));
+        assert!(!format!("{error:?}").contains(token));
+    }
+
+    #[tokio::test]
+    async fn malformed_success_decoding_never_retains_a_reflected_token() {
+        let token = "synthetic-secret-token";
+        let (api, server) = serve_api(vec![
+            (200, serde_json::json!({"ok":true,"result":token})),
+            (200, serde_json::json!({"ok":true,"result":token})),
+        ]);
+        let client = TelegramClient::new(token.to_string(), api);
+        let error = client.get_me().await.unwrap_err();
+        assert!(!format!("{error:#}").contains(token));
+        assert!(!format!("{error:?}").contains(token));
+        assert!(error.to_string().contains("getMe JSON decode failed"));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "synthetic upload").unwrap();
+        let error = client
+            .send_document(100, Some(7), file.path(), "fixture.txt", None)
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains(token));
+        assert!(!format!("{error:?}").contains(token));
+        assert!(
+            error
+                .to_string()
+                .contains("sendDocument JSON decode failed")
+        );
+        let requests = server.join().unwrap();
+        assert!(requests[1].0.contains("/sendDocument"));
+    }
 
     #[test]
     fn detects_foreign_bot_command_mentions() {

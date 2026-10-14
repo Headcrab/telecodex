@@ -21,16 +21,23 @@ pub struct Config {
     #[serde(default = "default_max_text_chunk")]
     pub max_text_chunk: usize,
     pub tmp_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub background_maintenance: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramConfig {
     pub bot_token: Option<String>,
     pub bot_token_env: Option<String>,
+    pub bot_token_file: Option<PathBuf>,
+    #[serde(default)]
+    pub lifecycle_notifications: bool,
     #[serde(default = "default_telegram_api_base")]
     pub api_base: String,
     #[serde(default = "default_true")]
     pub use_message_drafts: bool,
+    #[serde(default = "default_true")]
+    pub show_unfinished_messages: bool,
     pub primary_forum_chat_id: Option<i64>,
     #[serde(default)]
     pub auto_create_topics: bool,
@@ -66,6 +73,10 @@ impl StaleTopicAction {
 pub struct CodexConfig {
     #[serde(default = "default_codex_binary")]
     pub binary: PathBuf,
+    #[serde(default)]
+    pub shared_app_server: bool,
+    #[serde(default)]
+    pub auto_attach_latest_history: bool,
     pub default_cwd: PathBuf,
     pub default_model: Option<String>,
     pub default_reasoning_effort: Option<String>,
@@ -85,10 +96,11 @@ pub struct CodexConfig {
     pub import_cli_history: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     Disabled,
+    #[default]
     Live,
     Cached,
 }
@@ -100,12 +112,6 @@ impl SearchMode {
             Self::Live => "live",
             Self::Cached => "cached",
         }
-    }
-}
-
-impl Default for SearchMode {
-    fn default() -> Self {
-        Self::Disabled
     }
 }
 
@@ -216,6 +222,44 @@ impl Config {
 
 impl TelegramConfig {
     pub fn resolve_token(&self) -> Result<String> {
+        if let Some(path) = &self.bot_token_file {
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let mut file = options
+                .open(path)
+                .context("failed to open telegram token file")?;
+            let info = file
+                .metadata()
+                .context("failed to inspect telegram token file")?;
+            if !info.is_file() || info.len() > 4096 {
+                bail!("telegram token file must be a small regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if info.mode() & 0o077 != 0 || info.uid() != unsafe { libc::geteuid() } {
+                    bail!("telegram token file must be owner-only");
+                }
+            }
+            let mut token = String::new();
+            use std::io::Read;
+            file.by_ref()
+                .take(4097)
+                .read_to_string(&mut token)
+                .context("failed to read telegram token file")?;
+            if token.len() > 4096
+                || token.trim().is_empty()
+                || token.trim().chars().any(char::is_whitespace)
+            {
+                bail!("telegram token file must contain one nonempty token");
+            }
+            return Ok(token.trim().to_string());
+        }
         if let Some(token) = &self.bot_token {
             return Ok(token.clone());
         }
@@ -223,7 +267,7 @@ impl TelegramConfig {
             return std::env::var(env_name)
                 .with_context(|| format!("failed to read telegram token from env {env_name}"));
         }
-        bail!("configure telegram.bot_token or telegram.bot_token_env")
+        bail!("configure telegram.bot_token_file, telegram.bot_token or telegram.bot_token_env")
     }
 }
 
@@ -268,7 +312,7 @@ fn default_approval() -> String {
 }
 
 fn default_search_mode() -> SearchMode {
-    SearchMode::Disabled
+    SearchMode::Live
 }
 
 fn normalize_completion_notify_username(input: &str) -> Result<String> {
@@ -408,6 +452,69 @@ fn find_vendored_codex_exe(wrapper_path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_defaults_require_explicit_auxiliary_opt_in() {
+        let config: Config =
+            toml::from_str("[telegram]\nbot_token = 'synthetic'\n[codex]\ndefault_cwd = '/tmp'\n")
+                .unwrap();
+        assert!(!config.background_maintenance);
+        assert!(!config.telegram.lifecycle_notifications);
+        assert!(!config.codex.auto_attach_latest_history);
+        assert!(!config.codex.shared_app_server);
+        assert_eq!(config.codex.default_search_mode, SearchMode::Live);
+        for (value, expected) in [
+            ("disabled", SearchMode::Disabled),
+            ("cached", SearchMode::Cached),
+        ] {
+            let raw = format!(
+                "[telegram]\nbot_token = 'synthetic'\n[codex]\ndefault_cwd = '/tmp'\ndefault_search_mode = '{value}'\n"
+            );
+            let explicit: Config = toml::from_str(&raw).unwrap();
+            assert_eq!(explicit.codex.default_search_mode, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_private_regular_bounded_and_never_blocks_on_fifo() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bot.token");
+        let config_for = |path: &Path| {
+            let mut config: TelegramConfig = toml::from_str("bot_token = 'fallback'").unwrap();
+            config.bot_token_file = Some(path.to_path_buf());
+            config
+        };
+        fs::write(&path, "synthetic-token\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            config_for(&path).resolve_token().unwrap(),
+            "synthetic-token"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(config_for(&path).resolve_token().is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(config_for(&link).resolve_token().is_err());
+        for invalid in ["".to_string(), "two tokens".to_string(), "x".repeat(4097)] {
+            fs::write(&path, invalid).unwrap();
+            assert!(config_for(&path).resolve_token().is_err());
+        }
+        let fifo = dir.path().join("fifo");
+        let raw = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert!(config_for(&fifo).resolve_token().is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(config_for(dir.path()).resolve_token().is_err());
+        assert!(
+            config_for(&dir.path().join("missing"))
+                .resolve_token()
+                .is_err()
+        );
+    }
 
     #[test]
     fn normalizes_completion_notify_usernames() {

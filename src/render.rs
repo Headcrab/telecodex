@@ -43,7 +43,30 @@ pub fn render_markdown_to_html(input: &str) -> String {
         output.push_str("</code></pre>");
     }
 
-    if output.is_empty() {
+    // A streaming prefix such as "**" renders to empty tags. Telegram rejects
+    // that as empty text; keep the literal prefix until there is visible content.
+    let mut in_tag = false;
+    let visible: String = output
+        .chars()
+        .filter(|ch| match ch {
+            '<' => {
+                in_tag = true;
+                false
+            }
+            '>' => {
+                in_tag = false;
+                false
+            }
+            _ => !in_tag,
+        })
+        .collect();
+    if !input.trim().is_empty()
+        && html_escape::decode_html_entities(&visible)
+            .trim()
+            .is_empty()
+    {
+        encode_safe(input).to_string()
+    } else if output.is_empty() {
         "&nbsp;".to_string()
     } else {
         output

@@ -28,6 +28,10 @@
 
 ---
 
+## Maintained tribal fork
+
+AlterMundi maintains this fork for a dedicated human Telegram channel into the existing native Codex harness. See [deployment and continuity](docs/tribal-deployment.md) and [private-topic configuration](tribal.toml.example). Portable setup is distributed through AlterMundi/Skills. The qualified toolchain is Rust1.95.0; text builds use `--locked --no-default-features`.
+
 ## ✨ What it is
 
 **Telecodex** is a Rust bridge that connects a local `codex` CLI instance to Telegram.
@@ -58,6 +62,7 @@ No webhook infrastructure. No browser dependency. No cloud relay between Telegra
 - Polls Telegram Bot API via `getUpdates`.
 - Maintains one logical session per Telegram chat/topic pair.
 - Queues turns per session and streams progress with private chat drafts or in-place Telegram message edits.
+- Shows the remaining weekly Codex allowance and reset time above live progress; `/limits` shows both the 5-hour and weekly windows.
 - Steers an active Codex turn with new plain-text messages, matching Codex's mid-turn follow-up behavior; messages with attachments remain queued as separate turns.
 - Queues outbound Telegram deliveries per chat, applies a safer group/topic send cadence, and backs off when Telegram returns `retry_after`.
 - Supports `/new`, `/environments`, `/sessions`, `/use`, `/history`, `/status`, `/clear`, `/stop`, `/retry`, `/fast`, and per-session runtime settings.
@@ -143,7 +148,11 @@ High-level flow:
 | `/environments` | Show importable Codex environments in the primary forum dashboard |
 | `/sessions` | Show topic sessions in dashboard root, or Codex sessions for the current `cwd` inside a work topic |
 | `/history` | Browse final assistant messages from the selected Codex session with an interactive pager |
+| `/plan [prompt]` | Select native Plan mode for the topic's next turn; optionally queue a prompt |
+| `/default [prompt]` | Select native Default mode for the next turn; optionally queue a prompt |
+| `/questions` | Reopen your pending native questions in this topic |
 | `/status` | Show the current Telegram session, selected Codex session, and runtime settings |
+| `/rename <new name>` | Rename the current Codex session and Telegram topic together |
 | `/icon` | Choose this topic's icon from Telegram's paginated emoji catalog |
 | `/stop` | Stop the active turn |
 | `/retry <turn_id>` | Retry a failed or cancelled turn without attachments |
@@ -244,7 +253,7 @@ default_model = "gpt-5.4"
 default_reasoning_effort = "medium"
 default_sandbox = "workspace-write"
 default_approval = "never"
-default_search_mode = "disabled"
+default_search_mode = "live"
 import_desktop_history = true
 import_cli_history = true
 seed_workspaces = ["/absolute/path/to/workspace-a"]
@@ -271,9 +280,11 @@ Telecodex will start `codex login --device-auth`, send a clickable `auth.openai.
 
 ### Telegram
 
-- `telegram.bot_token` or `telegram.bot_token_env` must be configured.
+- Configure `telegram.bot_token_file` (a private, owner-only regular file), `telegram.bot_token`, or `telegram.bot_token_env`.
 - `telegram.use_message_drafts = true` enables `sendMessageDraft` previews for private chats; final replies are still sent as normal messages.
+- `telegram.show_unfinished_messages = false` hides unfinished text, tool progress and placeholders. Completed commentary and final responses are published permanently. This overrides draft previews; the default is `true`.
 - Group and topic previews use throttled `editMessageText` updates, and outbound Telegram deliveries are paced per chat to avoid Bot API rate limits.
+- Completed messages and final error notices wait for Telegram's retry delay and retry publication up to three times within 60 seconds. Partially delivered responses reuse confirmed message IDs; a deferred preview is never treated as confirmed final delivery.
 - `telegram.primary_forum_chat_id` is used by `/topic` to create topics in one dedicated forum.
 - `telegram.auto_create_topics = false` keeps environment import manual; set it to `true` to auto-create missing forum topics from history.
 - `telegram.forum_sync_topics_per_poll` throttles topic sync work.
@@ -286,7 +297,7 @@ Telecodex will start `codex login --device-auth`, send a clickable `auth.openai.
 - `codex.seed_workspaces` adds explicit workspace directories to `/environments` and forum sync, even before they have local Codex history.
 - `codex.default_add_dirs` entries must also be absolute existing directories.
 - `codex.import_desktop_history` and `codex.import_cli_history` control session import sources.
-- `codex.default_search_mode` supports `disabled`, `live`, and `cached`.
+- `codex.default_search_mode` defaults to `live`; explicit `disabled` and `cached` choices remain supported. Existing topics retain their saved mode until changed with `/search live`.
 
 ### Environment variables
 
@@ -376,3 +387,5 @@ This project is licensed under the [MIT License](./LICENSE).
 Built for people who want Codex local, but reachable from Telegram.
 
 </div>
+
+Native planning, question controls and recovery are documented in [native questions](docs/native-questions.md). The [Telegram convergence pilot](docs/telegram-convergence.md) records source provenance and reuse decisions.

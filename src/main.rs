@@ -9,6 +9,7 @@ mod render;
 mod store;
 mod telegram;
 mod transcribe;
+mod user_input;
 
 use anyhow::Result;
 use tokio::time::{Duration, sleep};
@@ -16,6 +17,22 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--probe-native") {
+        if !(args.len() == 4 || (args.len() == 5 && args[4] == "--create-thread-probes")) {
+            anyhow::bail!(
+                "Usage: telecodex --probe-native CODEX_BINARY CWD [--create-thread-probes]"
+            );
+        }
+        let cwd = std::fs::canonicalize(&args[3])?;
+        if !cwd.is_dir() {
+            anyhow::bail!("native probe cwd must be a directory");
+        }
+        let result =
+            codex::probe_native(std::path::Path::new(&args[2]), &cwd, args.len() == 5).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(

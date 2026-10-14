@@ -1155,9 +1155,14 @@ mod tests {
         )
         .unwrap();
 
-        let environments =
-            list_environments_for_sources(dir.path(), 10, false, false, &[workspace.clone()])
-                .unwrap();
+        let environments = list_environments_for_sources(
+            dir.path(),
+            10,
+            false,
+            false,
+            std::slice::from_ref(&workspace),
+        )
+        .unwrap();
 
         assert_eq!(environments.len(), 1);
         assert_eq!(environments[0].cwd, normalize_path(workspace));
@@ -1184,9 +1189,14 @@ mod tests {
         )
         .unwrap();
 
-        let environments =
-            list_environments_for_sources(dir.path(), 1, false, true, &[seed_workspace.clone()])
-                .unwrap();
+        let environments = list_environments_for_sources(
+            dir.path(),
+            1,
+            false,
+            true,
+            std::slice::from_ref(&seed_workspace),
+        )
+        .unwrap();
 
         assert_eq!(environments.len(), 1);
         assert_eq!(environments[0].cwd, normalize_path(seed_workspace));

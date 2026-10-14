@@ -21,6 +21,9 @@ pub(super) async fn process_turn(
     let turn_id = shared
         .store
         .record_turn_started(session.id, &queued.request)?;
+    if let Some(update_id) = queued.update_id {
+        shared.store.link_update_turn(update_id, turn_id)?;
+    }
     let turn_workspace = prepare_turn_workspace(&session, turn_id)?;
 
     let cancel = CancellationToken::new();
@@ -44,7 +47,14 @@ pub(super) async fn process_turn(
     let placeholder_text = render_placeholder_html(thinking_text, turn_banner.as_deref());
     let thread_id = Some(session.key.thread_id).filter(|value| *value != 0);
     let draft_id = turn_id;
-    let sink = if shared.config.telegram.use_message_drafts && queued.chat_kind == "private" {
+    let sink = if !shared.config.telegram.show_unfinished_messages {
+        Arc::new(Mutex::new(LiveTurnSink::new_preview(
+            shared.clone(),
+            &session,
+            turn_banner,
+            None,
+        )))
+    } else if shared.config.telegram.use_message_drafts && queued.chat_kind == "private" {
         match shared
             .telegram
             .send_message_draft(SendMessageDraft::html(
@@ -110,52 +120,109 @@ pub(super) async fn process_turn(
         });
     }
 
-    let run_result = shared
-        .codex
-        .run_turn(&session, &runtime_request, cancel.clone(), steer_rx, {
-            let sink = sink.clone();
-            let shared = shared.clone();
-            let approval_cancel = cancel.clone();
-            let requester_user_id = queued.request.from_user_id;
-            let session_key = session.key;
-            move |event| {
+    let run_result =
+        shared
+            .codex
+            .run_turn(&session, &runtime_request, cancel.clone(), steer_rx, {
                 let sink = sink.clone();
                 let shared = shared.clone();
-                let cancel = approval_cancel.clone();
-                async move {
-                    match event {
-                        CodexEvent::ApprovalRequest(request) => {
-                            if let Err(error) = sink
-                                .lock()
-                                .await
-                                .set_progress(approval_waiting_text(request.kind))
-                                .await
-                            {
-                                tracing::debug!(
-                                    "failed to update approval progress for {:?}: {error:#}",
-                                    session_key
-                                );
+                let approval_cancel = cancel.clone();
+                let requester_user_id = queued.request.from_user_id;
+                let session_key = session.key;
+                let preserve_thread_binding = queued.request.review_mode.is_none();
+                move |event| {
+                    let sink = sink.clone();
+                    let shared = shared.clone();
+                    let cancel = approval_cancel.clone();
+                    async move {
+                        match event {
+                            CodexEvent::ThreadStarted(thread_id) => {
+                                if preserve_thread_binding {
+                                    shared
+                                        .store
+                                        .set_session_codex_thread(session_key, &thread_id)?;
+                                    if super::rename::sync_native_title(&shared, session_key).await.is_err() {
+                                        let _ = send_markdown_message(
+                                            &shared.telegram,
+                                            session_key.chat_id,
+                                            Some(session_key.thread_id).filter(|id| *id > 0),
+                                            "The saved name could not be confirmed in Codex. Retry /rename with the intended name.",
+                                            None,
+                                        ).await;
+                                    }
+                                }
+                                sink.lock()
+                                    .await
+                                    .handle_event(CodexEvent::ThreadStarted(thread_id))
+                                    .await?;
+                                Ok(CodexEventOutcome::None)
                             }
-                            let decision = request_telegram_approval(
-                                shared,
-                                session_key.chat_id,
-                                Some(session_key.thread_id).filter(|value| *value != 0),
-                                requester_user_id,
+                            CodexEvent::ApprovalRequest(request) => {
+                                if let Err(error) = sink
+                                    .lock()
+                                    .await
+                                    .set_progress(approval_waiting_text(request.kind))
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        "failed to update approval progress for {:?}: {error:#}",
+                                        session_key
+                                    );
+                                }
+                                let decision = request_telegram_approval(
+                                    shared,
+                                    session_key.chat_id,
+                                    Some(session_key.thread_id).filter(|value| *value != 0),
+                                    requester_user_id,
+                                    request,
+                                    cancel,
+                                )
+                                .await?;
+                                Ok(CodexEventOutcome::Approval(decision))
+                            }
+                            CodexEvent::UserInputRequest {
+                                id,
                                 request,
-                                cancel,
-                            )
-                            .await?;
-                            Ok(CodexEventOutcome::Approval(decision))
-                        }
-                        other => {
-                            sink.lock().await.handle_event(other).await?;
-                            Ok(CodexEventOutcome::None)
+                                closed,
+                            } => {
+                                let receiver = questions::begin_dialogue(
+                                    shared,
+                                    session_key,
+                                    turn_id,
+                                    requester_user_id,
+                                    id,
+                                    request,
+                                    closed,
+                                )
+                                .await?;
+                                Ok(CodexEventOutcome::UserInput(receiver))
+                            }
+                            CodexEvent::UserInputClosed(id) => {
+                                shared.store.resolve_question_answers(turn_id, &id, false)?;
+                                shared.pending_questions.lock().await.retain(|_, p| {
+                                    p.local_turn_id != turn_id || p.request_id != id
+                                });
+                                Ok(CodexEventOutcome::None)
+                            }
+                            CodexEvent::UserInputAnswered(id) => {
+                                shared.store.resolve_question_answers(turn_id, &id, true)?;
+                                Ok(CodexEventOutcome::None)
+                            }
+                            other => {
+                                sink.lock().await.handle_event(other).await?;
+                                Ok(CodexEventOutcome::None)
+                            }
                         }
                     }
                 }
-            }
-        })
-        .await;
+            })
+            .await;
+
+    shared
+        .pending_questions
+        .lock()
+        .await
+        .retain(|_, p| p.local_turn_id != turn_id);
 
     *steer_slot.lock().expect("steer mutex poisoned") = None;
     *cancel_slot.lock().expect("cancel mutex poisoned") = None;
@@ -195,29 +262,9 @@ pub(super) async fn process_turn(
                 } else {
                     "failed"
                 };
-                let recovery_note = if should_reset_session_after_error(&error) {
-                    tracing::warn!(
-                        "resetting stale Codex thread binding for {:?} after error: {error:#}",
-                        session.key
-                    );
-                    match shared.store.clear_session_conversation(session.key) {
-                        Ok(()) => Some(
-                            "The saved Codex thread binding for this topic was reset. Retry the same request to start a fresh session."
-                                .to_string(),
-                        ),
-                        Err(clear_error) => {
-                            tracing::warn!(
-                                "failed to clear stale session conversation for {:?}: {clear_error:#}",
-                                session.key
-                            );
-                            shared.store.set_session_busy(session.key, false)?;
-                            None
-                        }
-                    }
-                } else {
-                    shared.store.set_session_busy(session.key, false)?;
-                    None
-                };
+                shared.store.set_session_busy(session.key, false)?;
+                let recovery_note = saved_thread_is_unavailable(&error).then(||
+                    "The saved native thread is unavailable. Its binding and your input are preserved. Recover the native context or explicitly clear this topic to start a new context.".to_string());
                 finish_failed_turn(&shared.store, turn_id, &sink, status, &error, recovery_note)
                     .await?;
                 Err(error)
@@ -285,10 +332,10 @@ async fn create_preview_sink_or_fail(
         shared,
         session,
         turn_banner,
-        TelegramMessageRef {
+        Some(TelegramMessageRef {
             chat_id: session.key.chat_id,
             message_id: placeholder.message_id,
-        },
+        }),
     ))))
 }
 
@@ -512,7 +559,7 @@ pub(super) fn turn_completion_notification_text(usernames: &[String]) -> Option<
     Some(format!("Готово, {} fyi ✅", usernames.join(" ")))
 }
 
-pub(super) fn should_reset_session_after_error(error: &anyhow::Error) -> bool {
+pub(super) fn saved_thread_is_unavailable(error: &anyhow::Error) -> bool {
     let pretty = format!("{error:#}").to_ascii_lowercase();
     let display = error.to_string().to_ascii_lowercase();
     let matches = |text: &str| {
@@ -532,6 +579,7 @@ struct LiveTurnSink {
     limits_inline: Option<String>,
     pending_text: String,
     has_assistant_text: bool,
+    message_committed: bool,
     last_flushed_text: String,
     last_flush_at: Instant,
     edit_backoff_until: Option<Instant>,
@@ -542,16 +590,22 @@ impl LiveTurnSink {
         shared: Arc<AppShared>,
         session: &crate::models::SessionRecord,
         limits_inline: Option<String>,
-        placeholder: TelegramMessageRef,
+        placeholder: Option<TelegramMessageRef>,
     ) -> Self {
+        let pending_text = if placeholder.is_some() {
+            "⏳".to_string()
+        } else {
+            String::new()
+        };
         Self {
             shared,
             session_key: session.key,
-            messages: vec![placeholder],
+            messages: placeholder.into_iter().collect(),
             draft_id: None,
             limits_inline,
-            pending_text: "⏳".to_string(),
+            pending_text,
             has_assistant_text: false,
+            message_committed: false,
             last_flushed_text: String::new(),
             last_flush_at: Instant::now() - Duration::from_secs(60),
             edit_backoff_until: None,
@@ -572,6 +626,7 @@ impl LiveTurnSink {
             limits_inline,
             pending_text: "⏳".to_string(),
             has_assistant_text: false,
+            message_committed: false,
             last_flushed_text: String::new(),
             last_flush_at: Instant::now() - Duration::from_secs(60),
             edit_backoff_until: None,
@@ -580,20 +635,47 @@ impl LiveTurnSink {
 
     async fn handle_event(&mut self, event: CodexEvent) -> Result<()> {
         match event {
+            CodexEvent::AssistantText(ref text)
+            | CodexEvent::CommentaryCompleted(ref text)
+            | CodexEvent::FinalAnswerCompleted(ref text)
+                if text.trim().is_empty() =>
+            {
+                // Empty native items are lifecycle events, not Telegram messages.
+                // Do not erase a draft or mutate an already published answer.
+                return Ok(());
+            }
             CodexEvent::Progress(text) => {
-                if !self.has_assistant_text {
+                if self.shared.config.telegram.show_unfinished_messages && !self.has_assistant_text
+                {
                     self.pending_text = progress_status_text(&text);
                 }
             }
             CodexEvent::AssistantText(text) => {
+                self.begin_next_message();
                 self.pending_text = text;
                 self.has_assistant_text = true;
+            }
+            CodexEvent::CommentaryCompleted(text) | CodexEvent::FinalAnswerCompleted(text) => {
+                self.begin_next_message();
+                self.pending_text = text;
+                self.has_assistant_text = true;
+                self.flush(true).await?;
+                // Only an acknowledged permanent publication may freeze this message.
+                if self.last_flushed_text != self.pending_text {
+                    anyhow::bail!("completed assistant publication was deferred by Telegram");
+                }
+                self.message_committed = true;
+                return Ok(());
             }
             CodexEvent::ThreadStarted(thread_id) => {
                 tracing::debug!("codex thread started: {thread_id}");
             }
+            CodexEvent::UserInputRequest { .. }
+            | CodexEvent::UserInputClosed(_)
+            | CodexEvent::UserInputAnswered(_) => {}
             CodexEvent::ApprovalRequest(request) => {
-                if !self.has_assistant_text {
+                if self.shared.config.telegram.show_unfinished_messages && !self.has_assistant_text
+                {
                     self.pending_text = approval_waiting_text(request.kind);
                 }
             }
@@ -602,7 +684,7 @@ impl LiveTurnSink {
     }
 
     async fn set_progress(&mut self, text: impl Into<String>) -> Result<()> {
-        if !self.has_assistant_text {
+        if self.shared.config.telegram.show_unfinished_messages && !self.has_assistant_text {
             self.pending_text = progress_status_text(&text.into());
             self.flush(false).await?;
         }
@@ -610,6 +692,13 @@ impl LiveTurnSink {
     }
 
     async fn finish(&mut self, final_error: Option<String>) -> Result<()> {
+        if self.message_committed {
+            if final_error.is_none() {
+                return Ok(());
+            }
+            self.begin_next_message();
+            self.pending_text.clear();
+        }
         if let Some(final_error) = final_error {
             self.pending_text = if self.pending_text.trim().is_empty() {
                 final_error
@@ -617,10 +706,48 @@ impl LiveTurnSink {
                 format!("{}\n\n{}", self.pending_text, final_error)
             };
         }
-        self.flush(true).await
+        self.flush(true).await?;
+        self.message_committed = self.last_flushed_text == self.pending_text;
+        Ok(())
+    }
+
+    fn begin_next_message(&mut self) {
+        if self.message_committed {
+            // References to committed messages must never be reused for another item.
+            self.messages.clear();
+            self.last_flushed_text.clear();
+            self.message_committed = false;
+        }
     }
 
     async fn flush(&mut self, force: bool) -> Result<()> {
+        if !force {
+            return self.flush_once(false).await.map(|_| ());
+        }
+        tokio::time::timeout(Duration::from_secs(60), async {
+            for _ in 0..3 {
+                if let Some(until) = self.edit_backoff_until {
+                    tokio::time::sleep_until(until.into()).await;
+                }
+                if self.flush_once(true).await? {
+                    return Ok(());
+                }
+            }
+            bail!("Telegram final delivery remained rate-limited after three attempts")
+        })
+        .await
+        .context("Telegram final delivery timed out after 60 seconds")?
+    }
+
+    async fn flush_once(&mut self, force: bool) -> Result<bool> {
+        if (!force && !self.shared.config.telegram.show_unfinished_messages)
+            || (force && self.pending_text.trim().is_empty())
+        {
+            return Ok(true);
+        }
+        if self.message_committed {
+            return Ok(true);
+        }
         if self
             .edit_backoff_until
             .is_some_and(|until| until <= Instant::now())
@@ -631,7 +758,7 @@ impl LiveTurnSink {
             .edit_backoff_until
             .is_some_and(|until| until > Instant::now())
         {
-            return Ok(());
+            return Ok(false);
         }
         let visible_text = self.visible_text(force);
         let min_flush_interval = self.min_flush_interval();
@@ -639,14 +766,14 @@ impl LiveTurnSink {
             && self.last_flushed_text == visible_text
             && self.last_flush_at.elapsed() < min_flush_interval
         {
-            return Ok(());
+            return Ok(true);
         }
         if !force && self.last_flush_at.elapsed() < min_flush_interval {
-            return Ok(());
+            return Ok(true);
         }
 
         if self.draft_id.is_some() && !force {
-            return self.flush_draft(&visible_text).await;
+            return self.flush_draft(&visible_text).await.map(|_| true);
         }
 
         let chunks = if force {
@@ -659,13 +786,10 @@ impl LiveTurnSink {
         };
         for (idx, chunk) in chunks.iter().enumerate() {
             let html = render_markdown_to_html(chunk);
-            if let Some(existing) = self
-                .messages
-                .get(idx)
-                .cloned()
-                .filter(|_| self.draft_id.is_none())
-            {
-                self.edit_message(existing, chunk, &html).await?;
+            if let Some(existing) = self.messages.get(idx).cloned() {
+                if !self.edit_message(existing, chunk, &html).await? {
+                    return Ok(false);
+                }
             } else {
                 let result = self
                     .shared
@@ -679,7 +803,7 @@ impl LiveTurnSink {
                 let message = match result {
                     Ok(message) => message,
                     Err(error) if self.defer_after_retry_after(&error, "telegram send chunk") => {
-                        return Ok(());
+                        return Ok(false);
                     }
                     Err(error) => return Err(error),
                 };
@@ -693,7 +817,7 @@ impl LiveTurnSink {
 
         self.last_flushed_text = visible_text;
         self.last_flush_at = Instant::now();
-        Ok(())
+        Ok(true)
     }
 
     fn min_flush_interval(&self) -> Duration {
@@ -751,7 +875,7 @@ impl LiveTurnSink {
         reference: TelegramMessageRef,
         raw_text: &str,
         html: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let result = self
             .shared
             .telegram
@@ -762,13 +886,13 @@ impl LiveTurnSink {
             ))
             .await;
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             Err(error) => {
                 if is_message_not_modified(&error) {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if self.defer_after_retry_after(&error, "telegram edit") {
-                    return Ok(());
+                    return Ok(false);
                 }
                 let fallback = html_escape::encode_safe(raw_text).to_string();
                 let fallback_result = self
@@ -781,13 +905,13 @@ impl LiveTurnSink {
                     ))
                     .await;
                 match fallback_result {
-                    Ok(_) => Ok(()),
-                    Err(fallback_error) if is_message_not_modified(&fallback_error) => Ok(()),
+                    Ok(_) => Ok(true),
+                    Err(fallback_error) if is_message_not_modified(&fallback_error) => Ok(true),
                     Err(fallback_error)
                         if self
                             .defer_after_retry_after(&fallback_error, "telegram edit fallback") =>
                     {
-                        Ok(())
+                        Ok(false)
                     }
                     Err(fallback_error) => Err(fallback_error)
                         .with_context(|| format!("telegram edit fallback failed after: {error:#}")),
@@ -800,7 +924,9 @@ impl LiveTurnSink {
         let Some(retry_after) = telegram_retry_after(error) else {
             return false;
         };
-        let until = Instant::now() + Duration::from_secs(retry_after.saturating_add(1));
+        // Longer server backoffs exceed final delivery's deadline. Bounding the
+        // instant also prevents a malformed retry_after from overflowing it.
+        let until = Instant::now() + Duration::from_secs(retry_after.saturating_add(1).min(61));
         self.edit_backoff_until = Some(until);
         tracing::warn!("{label} hit Telegram rate limit, backing off for {retry_after}s");
         true
@@ -1207,7 +1333,7 @@ pub(super) fn resolve_session_codex_binding_from_history(
     shared: &Arc<AppShared>,
     session: crate::models::SessionRecord,
 ) -> Result<crate::models::SessionRecord> {
-    if session.force_fresh_thread {
+    if session.force_fresh_thread || !shared.config.codex.auto_attach_latest_history {
         return Ok(session);
     }
     let codex_home = default_codex_home();
@@ -1417,6 +1543,179 @@ mod tests {
     use super::*;
     use crate::config::SearchMode;
 
+    fn delivered(id: i64) -> (u16, serde_json::Value) {
+        (
+            200,
+            serde_json::json!({"ok":true,"result": {
+                "message_id":id,"chat":{"id":1,"type":"private"},
+                "message_thread_id":2,"text":"receipt"
+            }}),
+        )
+    }
+
+    fn limited(seconds: u64) -> (u16, serde_json::Value) {
+        (
+            429,
+            serde_json::json!({"ok":false,"description":"rate limited",
+            "parameters":{"retry_after":seconds}}),
+        )
+    }
+
+    async fn delivery_sink(
+        mut replies: Vec<(u16, serde_json::Value)>,
+        draft: bool,
+        placeholder: bool,
+        chunk_size: usize,
+    ) -> (
+        LiveTurnSink,
+        tempfile::TempDir,
+        std::thread::JoinHandle<Vec<(String, serde_json::Value)>>,
+    ) {
+        replies.insert(
+            0,
+            (
+                200,
+                serde_json::json!({"ok":true,"result": {
+                    "id":123,"is_bot":true,"first_name":"Fixture"
+                }}),
+            ),
+        );
+        let (api, server) = crate::telegram::tests::serve_api(replies);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Config = toml::from_str(&format!(
+            "db_path='{}'\nstartup_admin_ids=[100]\nedit_debounce_ms=0\nmax_text_chunk={chunk_size}\n\
+             [telegram]\nbot_token='synthetic'\napi_base='{api}'\nshow_unfinished_messages=true\n\
+             [codex]\ndefault_cwd='{}'\n",
+            dir.path().join("state.sqlite").display(), dir.path().display()
+        )).unwrap();
+        config.telegram.use_message_drafts = draft;
+        let app = App::bootstrap(config).await.unwrap();
+        let session = session_with_service_tier(None);
+        let sink = if draft {
+            LiveTurnSink::new_draft(app.shared, &session, None, 1)
+        } else {
+            LiveTurnSink::new_preview(
+                app.shared,
+                &session,
+                None,
+                placeholder.then_some(TelegramMessageRef {
+                    chat_id: 1,
+                    message_id: 500,
+                }),
+            )
+        };
+        (sink, dir, server)
+    }
+
+    #[tokio::test]
+    async fn final_delivery_retries_actual_send_and_edit_rate_limits() {
+        for placeholder in [false, true] {
+            let (mut sink, _dir, server) =
+                delivery_sink(vec![limited(0), delivered(501)], false, placeholder, 4000).await;
+            sink.pending_text = "final answer".to_string();
+            sink.finish(None).await.unwrap();
+            assert!(sink.message_committed);
+            assert_eq!(sink.last_flushed_text, "final answer");
+            let requests = server.join().unwrap();
+            let method = if placeholder {
+                "/editMessageText"
+            } else {
+                "/sendMessage"
+            };
+            assert_eq!(requests.len(), 3);
+            assert!(requests[1].0.contains(method));
+            assert!(requests[2].0.contains(method));
+            assert_eq!(requests[1].1["text"], requests[2].1["text"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn final_delivery_waits_for_preview_and_draft_backoff() {
+        for draft in [false, true] {
+            let (mut sink, _dir, server) =
+                delivery_sink(vec![limited(0), delivered(501)], draft, !draft, 4000).await;
+            sink.pending_text = "preview answer".to_string();
+            sink.flush(false).await.unwrap();
+            assert!(
+                sink.last_flushed_text.is_empty(),
+                "a deferred edit was not delivered"
+            );
+            assert!(sink.edit_backoff_until.is_some());
+            sink.pending_text = "final answer".to_string();
+            sink.finish(None).await.unwrap();
+            assert!(sink.message_committed);
+            let requests = server.join().unwrap();
+            assert!(requests[1].0.contains(if draft {
+                "/sendMessageDraft"
+            } else {
+                "/editMessageText"
+            }));
+            assert!(requests[2].0.contains(if draft {
+                "/sendMessage"
+            } else {
+                "/editMessageText"
+            }));
+            assert_eq!(requests[2].1["text"], "final answer");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_draft_final_retry_reuses_delivered_chunks() {
+        let (mut sink, _dir, server) = delivery_sink(
+            vec![delivered(501), limited(0), delivered(501), delivered(502)],
+            true,
+            false,
+            5,
+        )
+        .await;
+        sink.pending_text = "abcdefghij".to_string();
+        sink.finish(None).await.unwrap();
+        assert!(sink.message_committed);
+        assert_eq!(sink.messages.len(), 2);
+        let requests = server.join().unwrap();
+        let sends = requests
+            .iter()
+            .filter(|(method, _)| method.contains("/sendMessage "))
+            .collect::<Vec<_>>();
+        assert_eq!(sends.len(), 3, "first chunk must not be sent twice");
+        assert_eq!(
+            sends
+                .iter()
+                .filter(|(_, body)| body["text"] == "abcde")
+                .count(),
+            1
+        );
+        assert!(requests[3].0.contains("/editMessageText"));
+        assert_eq!(requests[3].1["message_id"], 501);
+    }
+
+    #[tokio::test]
+    async fn persistent_final_rate_limit_fails_after_three_actual_attempts() {
+        let (mut sink, _dir, server) =
+            delivery_sink(vec![limited(0), limited(0), limited(0)], false, false, 4000).await;
+        sink.pending_text = "final answer".to_string();
+        let error = sink.finish(None).await.unwrap_err();
+        assert!(error.to_string().contains("three attempts"));
+        assert!(!sink.message_committed);
+        assert!(sink.last_flushed_text.is_empty());
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn final_delivery_deadline_bounds_existing_long_backoff() {
+        let (mut sink, _dir, server) = delivery_sink(vec![], false, false, 4000).await;
+        server.join().unwrap();
+        tokio::time::pause();
+        sink.pending_text = "final answer".to_string();
+        sink.edit_backoff_until = Some(Instant::now() + Duration::from_secs(120));
+        let started = tokio::time::Instant::now();
+        let error = sink.finish(None).await.unwrap_err();
+        assert!(error.to_string().contains("60 seconds"));
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(61));
+        assert!(!sink.message_committed);
+    }
+
     fn session_with_service_tier(service_tier: Option<&str>) -> crate::models::SessionRecord {
         crate::models::SessionRecord {
             id: 1,
@@ -1429,6 +1728,7 @@ mod tests {
             model: None,
             reasoning_effort: None,
             service_tier: service_tier.map(ToOwned::to_owned),
+            collaboration_mode: None,
             session_prompt: None,
             sandbox_mode: "workspace-write".to_string(),
             approval_policy: "never".to_string(),

@@ -67,7 +67,7 @@ pub fn find_latest_limits_snapshot(codex_home: &Path) -> Result<Option<LimitsSna
     let mut candidates = Vec::new();
     collect_jsonl_files(&codex_home.join("sessions"), &mut candidates)?;
     collect_jsonl_files(&codex_home.join("archived_sessions"), &mut candidates)?;
-    candidates.sort_by(|left, right| right.1.cmp(&left.1));
+    candidates.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     let mut snapshots = Vec::new();
     for (path, _) in candidates.into_iter().take(200) {
@@ -108,22 +108,10 @@ pub fn format_limits_summary(snapshot: &LimitsSnapshot) -> String {
 }
 
 pub fn format_limits_inline(snapshot: &LimitsSnapshot) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(primary) = &snapshot.primary {
-        if let Some(summary) = format_window_inline("5h", primary) {
-            parts.push(summary);
-        }
-    }
-    if let Some(secondary) = &snapshot.secondary {
-        if let Some(summary) = format_window_inline("7d", secondary) {
-            parts.push(summary);
-        }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
+    snapshot
+        .secondary
+        .as_ref()
+        .and_then(|window| format_window_inline("7d", window))
 }
 
 fn collect_jsonl_files(root: &Path, files: &mut Vec<(PathBuf, SystemTime)>) -> Result<()> {
@@ -306,9 +294,26 @@ mod tests {
 
         let formatted = format_limits_inline(&snapshot).unwrap();
         let lines = formatted.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("📅 7d ████░░░░  45%"));
+
+        let summary = format_limits_summary(&snapshot);
+        let lines = summary.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("🕔 5h ███████░  88%"));
         assert!(lines[1].starts_with("📅 7d ████░░░░  45%"));
+
+        let mut missing_weekly = snapshot.clone();
+        missing_weekly.secondary = None;
+        assert!(format_limits_inline(&missing_weekly).is_none());
+
+        let mut missing_weekly_usage = snapshot;
+        missing_weekly_usage
+            .secondary
+            .as_mut()
+            .unwrap()
+            .used_percent = None;
+        assert!(format_limits_inline(&missing_weekly_usage).is_none());
     }
 
     #[test]
@@ -368,9 +373,8 @@ mod tests {
         );
         let formatted = format_limits_inline(&selected).unwrap();
         let lines = formatted.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("🕔 5h ████░░░░  54%"));
-        assert!(lines[1].starts_with("📅 7d █░░░░░░░  16%"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("📅 7d █░░░░░░░  16%"));
     }
 
     #[test]

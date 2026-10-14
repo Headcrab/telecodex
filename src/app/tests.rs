@@ -83,8 +83,11 @@ fn sample_config(db_path: PathBuf, default_cwd: PathBuf) -> Config {
         telegram: crate::config::TelegramConfig {
             bot_token: Some("test-token".to_string()),
             bot_token_env: None,
+            bot_token_file: None,
+            lifecycle_notifications: false,
             api_base: "https://api.telegram.org".to_string(),
             use_message_drafts: false,
+            show_unfinished_messages: true,
             primary_forum_chat_id: None,
             auto_create_topics: false,
             forum_sync_topics_per_poll: 2,
@@ -94,6 +97,8 @@ fn sample_config(db_path: PathBuf, default_cwd: PathBuf) -> Config {
         },
         codex: crate::config::CodexConfig {
             binary: PathBuf::from("codex"),
+            shared_app_server: false,
+            auto_attach_latest_history: true,
             default_cwd: default_cwd.clone(),
             default_model: Some("gpt-5.4".to_string()),
             default_reasoning_effort: Some("medium".to_string()),
@@ -111,6 +116,7 @@ fn sample_config(db_path: PathBuf, default_cwd: PathBuf) -> Config {
         edit_debounce_ms: 250,
         max_text_chunk: 3500,
         tmp_dir: None,
+        background_maintenance: false,
     }
 }
 
@@ -127,14 +133,16 @@ fn sample_app() -> (App, NamedTempFile) {
             "https://api.telegram.org".to_string(),
         ),
         codex: CodexRunner::new(PathBuf::from("codex")),
+        bot_id: 123,
         bot_username: None,
-        bot_id: 0,
+        bot_has_topics: false,
         service_user_id: 0,
         handy_model_dir: None,
         session_defaults: sample_defaults(),
         limits_cache: Mutex::new(None),
         history_page_cache: Mutex::new(HistoryPageCache::default()),
         pending_approvals: Mutex::new(HashMap::new()),
+        pending_questions: Mutex::new(HashMap::new()),
         pending_icon_pickers: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
@@ -147,6 +155,176 @@ fn sample_app() -> (App, NamedTempFile) {
         },
         db,
     )
+}
+
+#[tokio::test]
+async fn failed_queue_admission_is_visible_without_redispatch() {
+    let (app, _db) = sample_app();
+    let key = SessionKey::new(1, Some(2));
+    let update: crate::telegram::Update = serde_json::from_value(serde_json::json!({
+        "update_id": 71,
+        "message": {
+            "message_id": 10, "chat": {"id": 1, "type": "private"},
+            "from": {"id": 100, "is_bot": false, "first_name": "Human"},
+            "text": "human request"
+        }
+    }))
+    .unwrap();
+    app.shared.store.admit_update(&update).unwrap();
+    app.shared.store.begin_update(71).unwrap();
+    let (sender, receiver) = mpsc::unbounded_channel();
+    drop(receiver);
+    app.workers.lock().await.insert(
+        key,
+        SessionWorkerHandle {
+            sender,
+            cancel: Arc::new(StdMutex::new(None)),
+            steer: Arc::new(StdMutex::new(None)),
+        },
+    );
+    let result = HUMAN_UPDATE_ID
+        .scope(71, app.enqueue_turn(sample_turn_request(key), "private"))
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        app.shared
+            .store
+            .uncertain_update_ids(100, SessionKey::new(1, None))
+            .unwrap(),
+        vec![71]
+    );
+    assert!(!app.shared.store.admit_update(&update).unwrap());
+    assert!(app.shared.store.begin_update(71).is_err());
+}
+
+#[test]
+fn independent_topics_preserve_native_bindings_across_restart_without_history_import() {
+    let _lock = codex_home_test_lock().lock().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let workspace = codex_home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(codex_home.path().join("sessions")).unwrap();
+    std::fs::write(
+        codex_home.path().join("sessions/rollout-unrelated.jsonl"),
+        serde_json::json!({
+            "timestamp": "2026-03-13T09:00:00Z", "type": "session_meta",
+            "payload": {"id": "unrelated-private-cli-thread",
+                "timestamp": "2026-03-13T09:00:00Z", "cwd": workspace, "source": "exec"}
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    let _codex_home_guard = CodexHomeGuard::set(codex_home.path());
+    let (mut app, db) = sample_app();
+    let shared = Arc::get_mut(&mut app.shared).unwrap();
+    shared.config.codex.auto_attach_latest_history = false;
+    shared.config.codex.import_cli_history = false;
+    shared.config.codex.import_desktop_history = false;
+    shared.session_defaults.cwd = workspace;
+    let defaults = shared.session_defaults.clone();
+    let shared = &app.shared;
+    let first = SessionKey::new(100, Some(11));
+    let second = SessionKey::new(100, Some(12));
+    for key in [first, second] {
+        let session = shared.store.ensure_session(key, 100, &defaults).unwrap();
+        let resolved = resolve_session_codex_binding_from_history(shared, session).unwrap();
+        assert!(resolved.codex_thread_id.is_none());
+    }
+    shared
+        .store
+        .set_session_codex_thread(first, "native-a")
+        .unwrap();
+    shared
+        .store
+        .set_session_codex_thread(second, "native-b")
+        .unwrap();
+    for (key, thread) in [(first, "native-a"), (second, "native-b")] {
+        let session = shared.store.get_session(key).unwrap().unwrap();
+        let resolved = resolve_session_codex_binding_from_history(shared, session).unwrap();
+        assert_eq!(resolved.codex_thread_id.as_deref(), Some(thread));
+    }
+    drop(app);
+    let store = Store::open(db.path(), &[100], &defaults).unwrap();
+    assert_eq!(
+        store
+            .get_session(first)
+            .unwrap()
+            .unwrap()
+            .codex_thread_id
+            .as_deref(),
+        Some("native-a")
+    );
+    assert_eq!(
+        store
+            .get_session(second)
+            .unwrap()
+            .unwrap()
+            .codex_thread_id
+            .as_deref(),
+        Some("native-b")
+    );
+}
+
+#[tokio::test]
+async fn private_topic_creation_uses_real_api_and_starts_an_isolated_session() {
+    let message: Message = serde_json::from_value(serde_json::json!({
+        "message_id": 3, "message_thread_id": 12,
+        "chat": {"id": 100, "type": "private"}, "text": "/topic New context"
+    }))
+    .unwrap();
+    let reply = serde_json::json!({"ok": true, "result": {
+        "message_id": 20, "chat": {"id": 100, "type": "private"}
+    }});
+    let (api, server) = crate::telegram::tests::serve_api(vec![
+        (
+            200,
+            serde_json::json!({"ok": true, "result": {"message_thread_id": 13, "name": "New context"}}),
+        ),
+        (200, reply.clone()),
+        (200, reply),
+    ]);
+    let (mut app, _db) = sample_app();
+    let shared = Arc::get_mut(&mut app.shared).unwrap();
+    shared.bot_has_topics = true;
+    shared.telegram = TelegramClient::new("synthetic".to_string(), api);
+    let key = SessionKey::new(100, Some(12));
+    shared
+        .store
+        .ensure_session(key, 100, &shared.session_defaults)
+        .unwrap();
+    shared
+        .store
+        .set_session_codex_thread(key, "existing-context")
+        .unwrap();
+    let user = shared.store.get_user(100).unwrap().unwrap();
+    app.handle_new_topic(&user, &message, Some("New context".to_string()))
+        .await
+        .unwrap();
+    let new_session = app
+        .shared
+        .store
+        .get_session(SessionKey::new(100, Some(13)))
+        .unwrap()
+        .unwrap();
+    assert!(new_session.codex_thread_id.is_none());
+    assert!(new_session.force_fresh_thread);
+    assert_eq!(
+        app.shared
+            .store
+            .get_session(key)
+            .unwrap()
+            .unwrap()
+            .codex_thread_id
+            .as_deref(),
+        Some("existing-context")
+    );
+    let requests = server.join().unwrap();
+    assert!(requests[0].0.contains("/createForumTopic"));
+    assert_eq!(requests[0].1["chat_id"], 100);
+    assert_eq!(requests[0].1["name"], "New context");
+    assert_eq!(requests[1].1["message_thread_id"], 13);
+    assert_eq!(requests[2].1["message_thread_id"], 12);
 }
 
 #[tokio::test]
@@ -201,7 +379,9 @@ async fn falls_back_when_the_active_turn_rejects_steering() {
         let steer = steer_rx.recv().await.expect("steer request");
         steer
             .response
-            .send(Err("turn already completed".to_string()))
+            .send(Err(CodexSteerError::Rejected(
+                "turn already completed".to_string(),
+            )))
             .expect("steer response");
     });
 
@@ -245,7 +425,9 @@ async fn keeps_steering_pending_past_the_previous_timeout() {
 
     steer
         .response
-        .send(Err("turn already completed".to_string()))
+        .send(Err(CodexSteerError::Rejected(
+            "turn already completed".to_string(),
+        )))
         .expect("steer response");
     assert!(!route.await.unwrap());
 }
@@ -272,7 +454,7 @@ fn only_plain_text_messages_are_steer_candidates() {
 fn detects_stale_codex_thread_errors() {
     let error = anyhow::anyhow!("no rollout found for thread id 019abc | code -32600");
 
-    assert!(should_reset_session_after_error(&error));
+    assert!(saved_thread_is_unavailable(&error));
 }
 
 #[test]
@@ -305,14 +487,14 @@ fn detects_stale_codex_thread_errors_in_error_context() {
     let error = anyhow::anyhow!("codex turn failed")
         .context("no rollout found for thread id 019abc | code -32600");
 
-    assert!(should_reset_session_after_error(&error));
+    assert!(saved_thread_is_unavailable(&error));
 }
 
 #[test]
 fn ignores_unrelated_invalid_request_errors() {
     let error = anyhow::anyhow!("json-rpc request rejected with code -32600");
 
-    assert!(!should_reset_session_after_error(&error));
+    assert!(!saved_thread_is_unavailable(&error));
 }
 
 #[test]
@@ -358,6 +540,7 @@ fn hides_sessions_overview_body_when_keyboard_is_available() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -373,7 +556,7 @@ fn hides_sessions_overview_body_when_keyboard_is_available() {
         title: Some("Codex chat".to_string()),
     };
 
-    let body = format_sessions_overview(&[session.clone()], session.key, &chat);
+    let body = format_sessions_overview(std::slice::from_ref(&session), session.key, &chat);
 
     assert_eq!(body, "\u{2063}");
 }
@@ -391,6 +574,7 @@ fn builds_clickable_chat_sessions_keyboard() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -428,6 +612,7 @@ fn builds_topic_links_for_dashboard_root_sessions_keyboard() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -446,6 +631,7 @@ fn builds_topic_links_for_dashboard_root_sessions_keyboard() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -490,6 +676,7 @@ fn session_environment_match_requires_same_title_and_cwd() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -528,6 +715,7 @@ fn forum_sync_preserves_manual_codex_binding() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -561,6 +749,7 @@ fn forum_sync_seeds_unbound_environment_session() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -594,6 +783,7 @@ fn forum_sync_preserves_fresh_thread_request() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -627,6 +817,7 @@ fn format_session_status_marks_unbound_codex_session() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -662,6 +853,7 @@ fn format_session_status_marks_fresh_codex_session() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -840,6 +1032,7 @@ fn history_callback_matches_only_current_session_binding() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -871,6 +1064,7 @@ fn history_callback_rejects_unbound_fresh_session() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -898,6 +1092,7 @@ fn formats_stale_history_page_for_rebound_topic() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -926,6 +1121,7 @@ fn builds_import_button_for_seed_environment() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -1056,6 +1252,7 @@ fn builds_clickable_codex_sessions_keyboard() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -1227,6 +1424,7 @@ fn keeps_audio_transcript_in_user_prompt_only() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -1286,6 +1484,7 @@ fn keeps_non_transcribed_audio_paths_in_user_prompt() {
         model: None,
         reasoning_effort: None,
         service_tier: None,
+        collaboration_mode: None,
         session_prompt: None,
         sandbox_mode: "workspace-write".to_string(),
         approval_policy: "never".to_string(),
@@ -1616,14 +1815,16 @@ fn rebinds_stale_session_to_latest_active_thread_for_same_cwd() {
             "https://api.telegram.org".to_string(),
         ),
         codex: CodexRunner::new(PathBuf::from("codex")),
+        bot_id: 123,
         bot_username: None,
-        bot_id: 0,
+        bot_has_topics: false,
         service_user_id: 0,
         handy_model_dir: None,
         session_defaults: sample_defaults(),
         limits_cache: Mutex::new(None),
         history_page_cache: Mutex::new(HistoryPageCache::default()),
         pending_approvals: Mutex::new(HashMap::new()),
+        pending_questions: Mutex::new(HashMap::new()),
         pending_icon_pickers: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
@@ -1681,14 +1882,16 @@ fn keeps_truly_archived_session_unbound_when_no_active_replacement_exists() {
             "https://api.telegram.org".to_string(),
         ),
         codex: CodexRunner::new(PathBuf::from("codex")),
+        bot_id: 123,
         bot_username: None,
-        bot_id: 0,
+        bot_has_topics: false,
         service_user_id: 0,
         handy_model_dir: None,
         session_defaults: sample_defaults(),
         limits_cache: Mutex::new(None),
         history_page_cache: Mutex::new(HistoryPageCache::default()),
         pending_approvals: Mutex::new(HashMap::new()),
+        pending_questions: Mutex::new(HashMap::new()),
         pending_icon_pickers: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
@@ -1711,4 +1914,304 @@ fn keeps_truly_archived_session_unbound_when_no_active_replacement_exists() {
     let rebound = resolve_session_codex_binding_from_history(&shared, session).unwrap();
 
     assert_eq!(rebound.codex_thread_id.as_deref(), Some("archived-thread"));
+}
+
+#[cfg(unix)]
+fn rename_native_fixture(root: &std::path::Path, reject: bool) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = root.join("native-fixture");
+    let log = root.join("native-requests.jsonl");
+    let script = r#"#!/usr/bin/env python3
+import json, sys
+log = LOG_PATH
+reject = REJECT
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get('method')
+    with open(log, 'a') as f:
+        f.write(json.dumps(request) + '\n')
+    if method == 'initialized':
+        continue
+    assert method in ('initialize', 'thread/name/set'), method
+    response = {'id': request['id'], 'result': {}}
+    if method == 'thread/name/set' and reject:
+        response = {'id': request['id'], 'error': {'code': -32602, 'message': 'fixture rejects rename'}}
+    print(json.dumps(response), flush=True)
+"#;
+    std::fs::write(
+        &binary,
+        script
+            .replace("LOG_PATH", &serde_json::to_string(&log).unwrap())
+            .replace("REJECT", if reject { "True" } else { "False" }),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (binary, log)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rename_command_preserves_busy_binding_and_persists_owner_name() {
+    let root = tempfile::tempdir().unwrap();
+    let (binary, log) = rename_native_fixture(root.path(), false);
+    let reply = serde_json::json!({"ok":true,"result":{"message_id":20,"chat":{"id":100,"type":"private"}}});
+    let (api, server) = crate::telegram::tests::serve_api(vec![
+        (200, serde_json::json!({"ok":true,"result":true})),
+        (200, reply),
+    ]);
+    let (mut app, db) = sample_app();
+    let shared = Arc::get_mut(&mut app.shared).unwrap();
+    shared.telegram = TelegramClient::new("synthetic".into(), api);
+    shared.codex = CodexRunner::new(binary);
+    let key = SessionKey::new(100, Some(12));
+    shared
+        .store
+        .ensure_session(key, 100, &shared.session_defaults)
+        .unwrap();
+    shared
+        .store
+        .set_session_codex_thread(key, "bound-thread")
+        .unwrap();
+    shared.store.set_session_busy(key, true).unwrap();
+    let other = SessionKey::new(100, Some(13));
+    shared
+        .store
+        .ensure_session(other, 100, &shared.session_defaults)
+        .unwrap();
+    shared
+        .store
+        .set_session_codex_thread(other, "other-thread")
+        .unwrap();
+    let update = serde_json::from_value(serde_json::json!({"update_id":501,"message":{
+        "message_id":3,"message_thread_id":12,"chat":{"id":100,"type":"private"},
+        "from":{"id":100,"is_bot":false,"first_name":"Human"},"text":"/rename Memoria y evolución"}})).unwrap();
+    app.process_update(update).await.unwrap();
+    let calls = server.join().unwrap();
+    assert!(calls[0].0.contains("editForumTopic"));
+    assert_eq!(calls[0].1["name"], "Memoria y evolución");
+    assert_eq!(calls[0].1["message_thread_id"], 12);
+    let requests: Vec<serde_json::Value> = std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "thread/name/set")
+            .count(),
+        1
+    );
+    let rename = requests
+        .iter()
+        .find(|r| r["method"] == "thread/name/set")
+        .unwrap();
+    assert_eq!(
+        rename["params"],
+        serde_json::json!({"threadId":"bound-thread","name":"Memoria y evolución"})
+    );
+    let session = app.shared.store.get_session(key).unwrap().unwrap();
+    assert!(session.busy);
+    assert_eq!(session.codex_thread_id.as_deref(), Some("bound-thread"));
+    assert_eq!(
+        app.shared
+            .store
+            .get_session(other)
+            .unwrap()
+            .unwrap()
+            .codex_thread_id
+            .as_deref(),
+        Some("other-thread")
+    );
+    app.shared.store.set_session_busy(key, false).unwrap();
+    drop(app);
+    let store = Store::open(db.path(), &[100], &sample_defaults()).unwrap();
+    assert_eq!(
+        store.explicit_session_title(key).unwrap().as_deref(),
+        Some("Memoria y evolución")
+    );
+    assert_eq!(
+        store
+            .get_session(key)
+            .unwrap()
+            .unwrap()
+            .session_title
+            .as_deref(),
+        Some("Memoria y evolución")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manual_topic_rename_and_partial_failure_are_visible_without_rename_loop() {
+    let root = tempfile::tempdir().unwrap();
+    let (binary, log) = rename_native_fixture(root.path(), true);
+    let (api, server) = crate::telegram::tests::serve_api(vec![(
+        200,
+        serde_json::json!({"ok":true,"result":{"message_id":20,"chat":{"id":100,"type":"private"}}}),
+    )]);
+    let (mut app, _db) = sample_app();
+    let shared = Arc::get_mut(&mut app.shared).unwrap();
+    shared.telegram = TelegramClient::new("synthetic".into(), api);
+    shared.codex = CodexRunner::new(binary);
+    let key = SessionKey::new(100, Some(12));
+    shared
+        .store
+        .ensure_session(key, 100, &shared.session_defaults)
+        .unwrap();
+    shared
+        .store
+        .set_session_codex_thread(key, "bound-thread")
+        .unwrap();
+    let update: crate::telegram::Update = serde_json::from_value(serde_json::json!({"update_id":502,"message":{
+        "message_id":3,"message_thread_id":12,"chat":{"id":100,"type":"private"},
+        "from":{"id":100,"is_bot":false,"first_name":"Human"},"forum_topic_edited":{"name":"Chosen topic"}}})).unwrap();
+    app.process_update(update.clone()).await.unwrap();
+    let calls = server.join().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].0.contains("sendMessage"));
+    assert!(
+        calls[0].1["text"]
+            .as_str()
+            .unwrap()
+            .contains("not confirmed")
+    );
+    assert_eq!(
+        app.shared
+            .store
+            .explicit_session_title(key)
+            .unwrap()
+            .as_deref(),
+        Some("Chosen topic")
+    );
+    let before = std::fs::read_to_string(&log).unwrap();
+    let mut bot_echo = update.clone();
+    bot_echo
+        .message
+        .as_mut()
+        .unwrap()
+        .from
+        .as_mut()
+        .unwrap()
+        .is_bot = true;
+    app.process_update(bot_echo).await.unwrap();
+    let mut icon_only = update.clone();
+    icon_only
+        .message
+        .as_mut()
+        .unwrap()
+        .forum_topic_edited
+        .as_mut()
+        .unwrap()
+        .name = None;
+    app.process_update(icon_only).await.unwrap();
+    let mut unauthorized = update;
+    unauthorized
+        .message
+        .as_mut()
+        .unwrap()
+        .from
+        .as_mut()
+        .unwrap()
+        .id = 999;
+    app.process_update(unauthorized).await.unwrap();
+    assert_eq!(std::fs::read_to_string(log).unwrap(), before);
+}
+
+#[tokio::test]
+async fn owner_title_on_unbound_topic_survives_environment_sync_without_native_work() {
+    let (app, _db) = sample_app();
+    let key = SessionKey::new(100, Some(12));
+    app.shared
+        .store
+        .ensure_session(key, 100, &app.shared.session_defaults)
+        .unwrap();
+    app.shared
+        .store
+        .set_explicit_session_title(key, "Chosen topic")
+        .unwrap();
+    assert!(
+        !super::rename::sync_native_title(&app.shared, key)
+            .await
+            .unwrap()
+    );
+    let session = app.shared.store.get_session(key).unwrap().unwrap();
+    let environment = CodexEnvironmentSummary {
+        cwd: session.cwd.clone(),
+        name: "Automatic environment".into(),
+        latest_thread_id: Some("unrelated-history".into()),
+        updated_at: "2026-10-07".into(),
+    };
+    assert!(
+        app.sync_environment_topic_metadata(100, &environment, &session)
+            .await
+            .unwrap()
+    );
+    let after = app.shared.store.get_session(key).unwrap().unwrap();
+    assert_eq!(after.session_title.as_deref(), Some("Chosen topic"));
+    assert!(after.codex_thread_id.is_none());
+    app.shared.store.delete_session(key).unwrap();
+    assert!(
+        app.shared
+            .store
+            .explicit_session_title(key)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unbound_rename_reports_topic_failure_and_applies_latest_name_after_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let (binary, log) = rename_native_fixture(root.path(), false);
+    let reply = serde_json::json!({"ok":true,"result":{"message_id":20,"chat":{"id":100,"type":"private"}}});
+    let (api, server) = crate::telegram::tests::serve_api(vec![
+        (200, serde_json::json!({"ok":true,"result":false})),
+        (200, reply),
+    ]);
+    let (mut app, _db) = sample_app();
+    let shared = Arc::get_mut(&mut app.shared).unwrap();
+    shared.telegram = TelegramClient::new("synthetic".into(), api);
+    shared.codex = CodexRunner::new(binary);
+    let key = SessionKey::new(100, Some(12));
+    let update = serde_json::from_value(serde_json::json!({"update_id":503,"message":{
+        "message_id":3,"message_thread_id":12,"chat":{"id":100,"type":"private"},
+        "from":{"id":100,"is_bot":false,"first_name":"Human"},"text":"/rename First name"}}))
+    .unwrap();
+    app.process_update(update).await.unwrap();
+    assert!(
+        !log.exists(),
+        "an unbound rename must not start native work"
+    );
+    let calls = server.join().unwrap();
+    let feedback = calls[1].1["text"].as_str().unwrap();
+    assert!(feedback.contains("first started"));
+    assert!(feedback.contains("Telegram topic rename was not confirmed"));
+    app.shared
+        .store
+        .set_explicit_session_title(key, "Latest name")
+        .unwrap();
+    app.shared
+        .store
+        .set_session_codex_thread(key, "first-bound-thread")
+        .unwrap();
+    assert!(
+        super::rename::sync_native_title(&app.shared, key)
+            .await
+            .unwrap()
+    );
+    let requests: Vec<serde_json::Value> = std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let native = requests
+        .iter()
+        .find(|r| r["method"] == "thread/name/set")
+        .unwrap();
+    assert_eq!(
+        native["params"],
+        serde_json::json!({"threadId":"first-bound-thread","name":"Latest name"})
+    );
 }

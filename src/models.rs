@@ -65,6 +65,7 @@ pub struct SessionRecord {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
+    pub collaboration_mode: Option<CollaborationMode>,
     pub session_prompt: Option<String>,
     pub sandbox_mode: String,
     pub approval_policy: String,
@@ -82,6 +83,34 @@ pub struct TurnRequest {
     pub attachments: Vec<LocalAttachment>,
     pub review_mode: Option<ReviewRequest>,
     pub override_search_mode: Option<SearchMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CollaborationMode {
+    Plan,
+    Default,
+}
+
+impl CollaborationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl TryFrom<&str> for CollaborationMode {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "plan" => Ok(Self::Plan),
+            "default" => Ok(Self::Default),
+            _ => anyhow::bail!("unsupported collaboration mode"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

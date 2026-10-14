@@ -1,0 +1,32 @@
+# Replace placeholders locally before explicitly starting a dedicated bot.
+db_path = "/absolute/local/state/telegram.sqlite3"
+startup_admin_ids = [123456789]
+poll_timeout_seconds = 30
+edit_debounce_ms = 900
+max_text_chunk = 3500
+tmp_dir = "/absolute/local/state/tmp"
+background_maintenance = false
+
+[telegram]
+bot_token_file = "/absolute/local/config/bot.token"
+api_base = "https://api.telegram.org"
+use_message_drafts = true
+lifecycle_notifications = false
+auto_create_topics = false
+stale_topic_action = "none"
+completion_notify_usernames = []
+# Enable private-chat topics through BotFather; no forum binding is required.
+
+[codex]
+binary = "/absolute/path/to/existing/codex"
+shared_app_server = true
+auto_attach_latest_history = false
+default_cwd = "/absolute/existing/workspace"
+default_sandbox = "workspace-write"
+default_approval = "on-request"
+# Full access without approvals requires an explicit choice in local configuration.
+default_search_mode = "live"
+import_desktop_history = false
+import_cli_history = false
+seed_workspaces = []
+default_add_dirs = []

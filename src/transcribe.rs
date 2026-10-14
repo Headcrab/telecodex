@@ -1,20 +1,30 @@
+#[cfg(feature = "audio-transcription")]
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+#[cfg(feature = "audio-transcription")]
+use anyhow::Context;
+use anyhow::{Result, bail};
+#[cfg(not(feature = "audio-transcription"))]
+use std::path::PathBuf;
+#[cfg(feature = "audio-transcription")]
 use tokio::process::Command;
+#[cfg(feature = "audio-transcription")]
 use transcribe_rs::{
     SpeechModel, TranscribeOptions,
     onnx::{Quantization, parakeet::ParakeetModel},
 };
+#[cfg(feature = "audio-transcription")]
 use uuid::Uuid;
 
 use crate::models::AttachmentTranscript;
 
+#[cfg(feature = "audio-transcription")]
 const HANDY_MODEL_DIR_NAME: &str = "parakeet-tdt-0.6b-v3-int8";
 
+#[cfg(feature = "audio-transcription")]
 pub fn detect_handy_parakeet_model_dir() -> Option<PathBuf> {
     handy_model_roots()
         .into_iter()
@@ -22,6 +32,21 @@ pub fn detect_handy_parakeet_model_dir() -> Option<PathBuf> {
         .find(|candidate| is_valid_parakeet_model_dir(candidate))
 }
 
+#[cfg(not(feature = "audio-transcription"))]
+pub fn detect_handy_parakeet_model_dir() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(feature = "audio-transcription"))]
+pub async fn transcribe_audio_file(
+    _model_dir: PathBuf,
+    _source_path: PathBuf,
+    _scratch_dir: PathBuf,
+) -> Result<AttachmentTranscript> {
+    bail!("audio transcription is disabled in this build")
+}
+
+#[cfg(feature = "audio-transcription")]
 pub async fn transcribe_audio_file(
     model_dir: PathBuf,
     source_path: PathBuf,
@@ -53,6 +78,7 @@ pub async fn transcribe_audio_file(
     transcript_result
 }
 
+#[cfg(feature = "audio-transcription")]
 async fn convert_audio_to_wav(source_path: &Path, wav_path: &Path) -> Result<()> {
     let output = Command::new("ffmpeg")
         .arg("-y")
@@ -80,6 +106,7 @@ async fn convert_audio_to_wav(source_path: &Path, wav_path: &Path) -> Result<()>
     bail!("ffmpeg exited with status {}: {stderr}", output.status);
 }
 
+#[cfg(feature = "audio-transcription")]
 fn handy_model_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(appdata) = std::env::var_os("APPDATA") {
@@ -100,6 +127,7 @@ fn handy_model_roots() -> Vec<PathBuf> {
     roots
 }
 
+#[cfg(feature = "audio-transcription")]
 fn is_valid_parakeet_model_dir(dir: &Path) -> bool {
     [
         "encoder-model.int8.onnx",
@@ -111,7 +139,7 @@ fn is_valid_parakeet_model_dir(dir: &Path) -> bool {
     .all(|name| dir.join(name).is_file())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "audio-transcription"))]
 mod tests {
     use super::*;
 
