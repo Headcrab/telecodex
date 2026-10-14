@@ -1,10 +1,10 @@
 # Native Codex deployment for tribal embodiments
 
-This maintained AlterMundi fork builds on [Headcrab/telecodex](https://github.com/Headcrab/telecodex), retaining its MIT license and native Codex App Server integration. Matrix parent [234](https://github.com/AlterMundi/daimon-matrix/issues/234) and this repository's issue1 own this delivery. Portable distribution lives in AlterMundi/Skills; secrets, human allowlists, service configuration and body bindings remain local.
+This maintained AlterMundi fork builds on [Headcrab/telecodex](https://github.com/Headcrab/telecodex), retaining its MIT license and native Codex App Server integration. Matrix parent [234](https://github.com/AlterMundi/daimon-matrix/issues/234) and this repository's issue 1 own this delivery. Portable distribution lives in AlterMundi/Skills; secrets, human allowlists, service configuration and body bindings remain local.
 
 ## Build the selected revision
 
-Use an exact reviewed 40-character Git commit, the committed Cargo.lock and Rust1.95.0 (the qualified toolchain in rust-toolchain.toml). Do not resolve a moving branch during deployment. Unix Linux/macOS are the intended text deployment surfaces; CI qualifies both. Existing upstream MSRV1.85 is retained in Cargo metadata, but this fork's locked release is qualified with1.95.0, not a claim that every optional platform dependency runs on1.85.
+Use an exact reviewed 40-character Git commit, the committed Cargo.lock and Rust 1.95.0 (the qualified toolchain in rust-toolchain.toml). Do not resolve a moving branch during deployment. Unix Linux/macOS are the intended text deployment surfaces; CI qualifies both. Existing upstream MSRV 1.85 is retained in Cargo metadata, but this fork's locked release is qualified with 1.95.0, not a claim that every optional platform dependency runs on 1.85.
 
 ```bash
 cargo build --locked --release --no-default-features
@@ -15,11 +15,11 @@ Text-first deployment needs no transcription model, ONNX runtime or ffmpeg. Audi
 
 ## Local bot and harness binding
 
-Create a dedicated bot through BotFather and enable its private-chat topics. Do not reuse a bot whose getUpdates stream is already consumed by another gateway. A bot's token file must be a small owner-owned regular file with mode0600; its containing directory should be0700. Token file reads reject symlinks, FIFOs and files accessible by another user. Never put the token in repository configuration, command arguments or logs.
+Create a dedicated bot through BotFather and enable its private-chat topics. Do not reuse a bot whose getUpdates stream is already consumed by another gateway. A bot's token file must be a small owner-owned regular file with mode 0600; its containing directory should be 0700. Token file reads reject symlinks, FIFOs and files accessible by another user. Never put the token in repository configuration, command arguments or logs.
 
 Copy tribal.toml.example to a private local configuration and select the exact numeric human Telegram ID before starting. All absolute paths, the allowlist, Codex executable and body-specific settings are local. Preserve the embodiment's existing CODEX_HOME, authentication, owner-selected AGENTS, skills and HMK binding. Do not copy another harness's prompt, identity or memory database.
 
-Set codex.shared_app_server=true to use the existing native `codex app-server proxy`. This requires a Codex version whose native CLI supports that command; verify `codex app-server proxy --help` locally. The managed proxy carries raw WebSocket bytes rather than JSON-lines RPC. This fork performs the native HTTP upgrade and WebSocket framing, as verified against the official release protocol in [Matrix239](https://github.com/AlterMundi/daimon-matrix/issues/239). The bridge must use the same home/account as the existing interactive harness. Proxy failure is reported; it does not silently select another harness or discard a missing saved thread.
+Set codex.shared_app_server=true to use the existing native `codex app-server proxy`. This requires a Codex version whose native CLI supports that command; verify `codex app-server proxy --help` locally. The managed proxy carries raw WebSocket bytes rather than JSON-lines RPC. This fork performs the native HTTP upgrade and WebSocket framing, as verified against the official release protocol in [Matrix 239](https://github.com/AlterMundi/daimon-matrix/issues/239). The bridge must use the same home/account as the existing interactive harness. Proxy failure is reported; it does not silently select another harness or discard a missing saved thread.
 
 First qualify the existing native proxy without loading bot configuration or starting inference:
 

@@ -280,7 +280,7 @@ Telecodex will start `codex login --device-auth`, send a clickable `auth.openai.
 
 ### Telegram
 
-- `telegram.bot_token` or `telegram.bot_token_env` must be configured.
+- Configure `telegram.bot_token_file` (a private, owner-only regular file), `telegram.bot_token`, or `telegram.bot_token_env`.
 - `telegram.use_message_drafts = true` enables `sendMessageDraft` previews for private chats; final replies are still sent as normal messages.
 - `telegram.show_unfinished_messages = false` hides unfinished text, tool progress and placeholders. Completed commentary and final responses are published permanently. This overrides draft previews; the default is `true`.
 - Group and topic previews use throttled `editMessageText` updates, and outbound Telegram deliveries are paced per chat to avoid Bot API rate limits.

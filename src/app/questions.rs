@@ -128,9 +128,22 @@ pub(super) async fn begin_dialogue(
         responder,
         closed,
     };
-    show_question(&shared, &token, &mut pending).await?;
+    let shown = show_question(&shared, &token, &mut pending).await;
+    if shown.as_ref().err().is_some_and(|error| {
+        error.to_string() == "native question delivery did not confirm its Telegram topic"
+    }) {
+        return shown.map(|_| receiver);
+    }
     if !pending.closed.is_cancelled() && !pending.responder.is_closed() {
         shared.pending_questions.lock().await.insert(token, pending);
+    }
+    if let Err(error) = shown {
+        tracing::warn!("native question display failed; retained for /questions: {error:#}");
+        let _ = shared.telegram.send_message(SendMessage::html(
+            session.chat_id,
+            Some(session.thread_id).filter(|id| *id != 0),
+            "Could not display the native question. Use /questions to reopen it, or /stop to cancel the turn.".to_string(),
+        )).await;
     }
     Ok(receiver)
 }

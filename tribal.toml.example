@@ -22,8 +22,9 @@ binary = "/absolute/path/to/existing/codex"
 shared_app_server = true
 auto_attach_latest_history = false
 default_cwd = "/absolute/existing/workspace"
-default_sandbox = "danger-full-access"
-default_approval = "never"
+default_sandbox = "workspace-write"
+default_approval = "on-request"
+# Full access without approvals requires an explicit choice in local configuration.
 default_search_mode = "live"
 import_desktop_history = false
 import_cli_history = false

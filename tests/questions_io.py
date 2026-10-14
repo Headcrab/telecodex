@@ -34,7 +34,7 @@ class Journey:
         self.finished = threading.Event()
         self.question = threading.Event()
         self.delivery_reply = threading.Event()
-        self.fail_question_prefix = None
+        self.fail_question_prefix = 'Codex question 1/' if mode == 'initial_send_failure' else None
         self.failed_deliveries = 0
         owner = self
 
@@ -314,7 +314,12 @@ def scenario(binary, mode):
     j = Journey(binary, mode)
     question_id = 17 if mode == 'numeric' else 'question-native-topic-7'
     try:
-        j.start(); original = j.admit('/plan produce a small plan')
+        j.start()
+        if mode == 'initial_receipt_store_failure':
+            j.wait(lambda: (j.root / 'state.sqlite').exists() and j.row("SELECT name FROM sqlite_master WHERE name='question_messages'"))
+            with sqlite3.connect(j.root / 'state.sqlite') as db:
+                db.execute("CREATE TRIGGER fail_question_write BEFORE INSERT ON question_messages BEGIN SELECT RAISE(FAIL, 'synthetic store failure'); END")
+        original = j.admit('/plan produce a small plan')
         if mode == 'unsupported':
             j.wait(lambda: any('does not advertise plan mode' in m[1]['text'] for m in j.messages))
             assert not any(m.get('method') == 'turn/start' for m in j.rpc)
@@ -328,9 +333,21 @@ def scenario(binary, mode):
             j.wait(lambda: any('delivery did not confirm' in m[1]['text'] for m in j.messages))
             assert not j.answers
             print(json.dumps({'scenario':mode,'unbound_controls_rejected':True}),flush=True); return
+        if mode in ('initial_send_failure', 'initial_receipt_store_failure'):
+            j.wait(lambda: any('Use /questions to reopen' in m[1]['text'] for m in j.messages))
+            assert j.row('SELECT status FROM turns') == [('running',)]
+            assert not j.answers and not any(m.get('method') == 'turn/interrupt' for m in j.rpc)
+            if mode == 'initial_receipt_store_failure':
+                with sqlite3.connect(j.root / 'state.sqlite') as db:
+                    db.execute('DROP TRIGGER fail_question_write')
+            j.admit('/questions')
+            j.wait(lambda: any('Pending Codex questions.' in m[1]['text'] for m in j.messages))
+            picker = next(m for m in reversed(j.messages) if 'Pending Codex questions.' in m[1]['text'])
+            reopened_id = j.admit(callback=(picker[0], picker[1]['reply_markup']['inline_keyboard'][0][0]['callback_data']))
+            j.wait(lambda: j.row('SELECT status FROM incoming_updates WHERE update_id=?', (reopened_id,)) == [('handled',)])
         j.wait(lambda: j.controls(1))
         first = j.controls(1)
-        assert len([m for m in j.messages if html.unescape(m[1]['text']).startswith('Codex question 1/') and 'inline_keyboard' in m[1].get('reply_markup', {})]) == 1
+        assert len([m for m in j.messages if html.unescape(m[1]['text']).startswith('Codex question 1/') and 'inline_keyboard' in m[1].get('reply_markup', {})]) == (2 if mode == 'initial_receipt_store_failure' else 1)
         assert all(len(html.unescape(m[1]['text']).encode('utf-16-le'))//2 <= 4096 for m in j.messages)
         if mode in ('restart', 'restart_gap'):
             if mode == 'restart':
@@ -486,5 +503,5 @@ def scenario(binary, mode):
 
 if __name__ == '__main__':
     binary = str(pathlib.Path(sys.argv[1]).resolve())
-    for mode in sys.argv[2:] or ['implicit_reply','force_reply','roundtrip','async','numeric','long','two_topics','default','cancel','stop','secret','restart','restart_gap','disconnect','unsupported','wrong_receipt','reopen_failure','question_send_failure','answer_store_failure','receipt_store_failure']:
+    for mode in sys.argv[2:] or ['implicit_reply','force_reply','roundtrip','async','numeric','long','two_topics','default','cancel','stop','secret','restart','restart_gap','disconnect','unsupported','wrong_receipt','reopen_failure','question_send_failure','answer_store_failure','receipt_store_failure','initial_send_failure','initial_receipt_store_failure']:
         scenario(binary, mode)
