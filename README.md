@@ -389,3 +389,11 @@ Built for people who want Codex local, but reachable from Telegram.
 </div>
 
 Native planning, question controls and recovery are documented in [native questions](docs/native-questions.md). The [Telegram convergence pilot](docs/telegram-convergence.md) records source provenance and reuse decisions.
+
+## Optional activity observer
+
+A separately activated, inference-free companion can show quiet native work and
+weekly allowance in an editable Telegram card. See
+[the activity contract](docs/activity-indicator.md) for required native transport
+prerequisites, supported versions, setup and recovery. It consumes no Telegram
+updates and never starts or steers native turns.

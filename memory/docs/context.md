@@ -17,6 +17,9 @@ bindings, authorized input admission, pending human controls and output delivery
   and rollback. Keep credentials and conversation databases outside version control.
 - [Convergence research](../../docs/telegram-convergence.md): provenance and the
   distinction between synthetic qualification and human Telegram acceptance.
+- [Optional activity observer](../../docs/activity-indicator.md): read-only native
+  metadata and ingress-journal observation, private state, opt-in activation and
+  independent Python qualification. The Rust bridge remains the sole update consumer.
 
 ## Integration decisions
 
