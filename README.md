@@ -144,6 +144,7 @@ High-level flow:
 | `/sessions` | Show topic sessions in dashboard root, or Codex sessions for the current `cwd` inside a work topic |
 | `/history` | Browse final assistant messages from the selected Codex session with an interactive pager |
 | `/status` | Show the current Telegram session, selected Codex session, and runtime settings |
+| `/icon` | Choose this topic's icon from Telegram's paginated emoji catalog |
 | `/stop` | Stop the active turn |
 | `/retry <turn_id>` | Retry a failed or cancelled turn without attachments |
 | `/model [model\|default\|-]` | Set or show the current model |
@@ -161,6 +162,14 @@ High-level flow:
 | `/deny <tg_user_id>` | Admin: deny a Telegram user |
 | `/role <tg_user_id> <admin\|user>` | Admin: assign role |
 | `/restart_bot` | Admin: restart the bot process |
+
+`/icon` works inside private bot topics and forum topics, including on iOS. It fetches
+Telegram's allowed icon catalog and shows 24 emojis per page, with previous/next,
+default-icon and cancel buttons. Only the person who opened the picker can use it;
+buttons expire after 15 minutes, after selection/cancellation, or on restart. This
+command makes no Codex/model calls and does not change the topic name or native
+session. Telegram does not permit changing the General topic icon or the original
+default bubble color.
 
 ### Forwarded to Codex as-is
 

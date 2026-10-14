@@ -114,6 +114,7 @@ fn sample_config(db_path: PathBuf, default_cwd: PathBuf) -> Config {
     }
 }
 
+/// Build an isolated app fixture with a temporary SQLite store and empty picker state.
 fn sample_app() -> (App, NamedTempFile) {
     let db = NamedTempFile::new().unwrap();
     let config = sample_config(db.path().to_path_buf(), sample_workspace());
@@ -127,12 +128,14 @@ fn sample_app() -> (App, NamedTempFile) {
         ),
         codex: CodexRunner::new(PathBuf::from("codex")),
         bot_username: None,
+        bot_id: 0,
         service_user_id: 0,
         handy_model_dir: None,
         session_defaults: sample_defaults(),
         limits_cache: Mutex::new(None),
         history_page_cache: Mutex::new(HistoryPageCache::default()),
         pending_approvals: Mutex::new(HashMap::new()),
+        pending_icon_pickers: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
         shutdown: CancellationToken::new(),
@@ -1569,6 +1572,7 @@ async fn upload_failure_marks_turn_failed_and_cleanup_still_runs() {
 }
 
 #[test]
+/// A stale binding should move to the latest active native thread for its workspace.
 fn rebinds_stale_session_to_latest_active_thread_for_same_cwd() {
     let _lock = codex_home_test_lock().lock().unwrap();
     let codex_home = tempfile::tempdir().unwrap();
@@ -1613,12 +1617,14 @@ fn rebinds_stale_session_to_latest_active_thread_for_same_cwd() {
         ),
         codex: CodexRunner::new(PathBuf::from("codex")),
         bot_username: None,
+        bot_id: 0,
         service_user_id: 0,
         handy_model_dir: None,
         session_defaults: sample_defaults(),
         limits_cache: Mutex::new(None),
         history_page_cache: Mutex::new(HistoryPageCache::default()),
         pending_approvals: Mutex::new(HashMap::new()),
+        pending_icon_pickers: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
         shutdown: CancellationToken::new(),
@@ -1643,6 +1649,7 @@ fn rebinds_stale_session_to_latest_active_thread_for_same_cwd() {
 }
 
 #[test]
+/// An archived thread stays unbound when no active workspace replacement exists.
 fn keeps_truly_archived_session_unbound_when_no_active_replacement_exists() {
     let _lock = codex_home_test_lock().lock().unwrap();
     let codex_home = tempfile::tempdir().unwrap();
@@ -1675,12 +1682,14 @@ fn keeps_truly_archived_session_unbound_when_no_active_replacement_exists() {
         ),
         codex: CodexRunner::new(PathBuf::from("codex")),
         bot_username: None,
+        bot_id: 0,
         service_user_id: 0,
         handy_model_dir: None,
         session_defaults: sample_defaults(),
         limits_cache: Mutex::new(None),
         history_page_cache: Mutex::new(HistoryPageCache::default()),
         pending_approvals: Mutex::new(HashMap::new()),
+        pending_icon_pickers: Mutex::new(HashMap::new()),
         pending_codex_login: Mutex::new(None),
         codex_login_backoff_until: Mutex::new(None),
         shutdown: CancellationToken::new(),

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod auth;
 mod forum;
+mod icons;
 mod io;
 mod presentation;
 mod support;
@@ -72,12 +73,14 @@ struct AppShared {
     telegram: TelegramClient,
     codex: CodexRunner,
     bot_username: Option<String>,
+    bot_id: i64,
     service_user_id: i64,
     handy_model_dir: Option<PathBuf>,
     session_defaults: SessionDefaults,
     limits_cache: Mutex<Option<CachedLimitsSnapshot>>,
     history_page_cache: Mutex<HistoryPageCache>,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
+    pending_icon_pickers: Mutex<HashMap<String, icons::PendingIconPicker>>,
     pending_codex_login: Mutex<Option<PendingCodexLogin>>,
     codex_login_backoff_until: Mutex<Option<Instant>>,
     shutdown: CancellationToken,
@@ -200,6 +203,7 @@ impl App {
     const HISTORY_PAGE_CACHE_MAX_ENTRIES: usize = 64;
     const HISTORY_PAGE_CACHE_TTL_SECONDS: u64 = 300;
 
+    /// Initialize Telegram identity, persistent sessions and in-memory interaction state.
     pub async fn bootstrap(config: Config) -> Result<Self> {
         let token = config.telegram.resolve_token()?;
         let telegram = TelegramClient::new(token, config.telegram.api_base.clone());
@@ -221,12 +225,14 @@ impl App {
                 telegram,
                 codex,
                 bot_username: me.username,
+                bot_id: me.id,
                 service_user_id,
                 handy_model_dir,
                 session_defaults,
                 limits_cache: Mutex::new(None),
                 history_page_cache: Mutex::new(HistoryPageCache::default()),
                 pending_approvals: Mutex::new(HashMap::new()),
+                pending_icon_pickers: Mutex::new(HashMap::new()),
                 pending_codex_login: Mutex::new(None),
                 codex_login_backoff_until: Mutex::new(None),
                 shutdown: CancellationToken::new(),
@@ -429,6 +435,7 @@ impl App {
         Ok(())
     }
 
+    /// Route allowed users' callbacks to the matching picker, approval or history handler.
     async fn process_callback_query(&self, callback: crate::telegram::CallbackQuery) -> Result<()> {
         let Some(message) = callback.message else {
             return Ok(());
@@ -445,6 +452,12 @@ impl App {
         let Some(data) = callback.data else {
             return Ok(());
         };
+        if self
+            .handle_icon_callback(&message, callback.from.id, &data)
+            .await?
+        {
+            return Ok(());
+        }
         if let Some((token, decision)) = parse_approval_callback_data(&data) {
             let pending = {
                 let mut approvals = self.shared.pending_approvals.lock().await;
@@ -624,6 +637,7 @@ impl App {
         Ok(true)
     }
 
+    /// Execute bridge commands or forward native input for the selected topic session.
     async fn handle_command(
         &self,
         user: &crate::models::UserRecord,
@@ -891,6 +905,10 @@ impl App {
                         )
                         .await?;
                     }
+                }
+                BridgeCommand::Icon => {
+                    self.show_topic_icon_picker(message, user.tg_user_id)
+                        .await?;
                 }
                 BridgeCommand::Status => {
                     if is_primary_forum_dashboard(
