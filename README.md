@@ -153,6 +153,7 @@ High-level flow:
 | `/questions` | Reopen your pending native questions in this topic |
 | `/status` | Show the current Telegram session, selected Codex session, and runtime settings |
 | `/rename <new name>` | Rename the current Codex session and Telegram topic together |
+| `/icon` | Choose this topic's icon from Telegram's paginated emoji catalog |
 | `/stop` | Stop the active turn |
 | `/retry <turn_id>` | Retry a failed or cancelled turn without attachments |
 | `/model [model\|default\|-]` | Set or show the current model |
@@ -170,6 +171,14 @@ High-level flow:
 | `/deny <tg_user_id>` | Admin: deny a Telegram user |
 | `/role <tg_user_id> <admin\|user>` | Admin: assign role |
 | `/restart_bot` | Admin: restart the bot process |
+
+`/icon` works inside private bot topics and forum topics, including on iOS. It fetches
+Telegram's allowed icon catalog and shows 24 emojis per page, with previous/next,
+default-icon and cancel buttons. Only the person who opened the picker can use it;
+buttons expire after 15 minutes, after selection/cancellation, or on restart. This
+command makes no Codex/model calls and does not change the topic name or native
+session. Telegram does not permit changing the General topic icon or the original
+default bubble color.
 
 ### Forwarded to Codex as-is
 
@@ -275,6 +284,7 @@ Telecodex will start `codex login --device-auth`, send a clickable `auth.openai.
 - `telegram.use_message_drafts = true` enables `sendMessageDraft` previews for private chats; final replies are still sent as normal messages.
 - `telegram.show_unfinished_messages = false` hides unfinished text, tool progress and placeholders. Completed commentary and final responses are published permanently. This overrides draft previews; the default is `true`.
 - Group and topic previews use throttled `editMessageText` updates, and outbound Telegram deliveries are paced per chat to avoid Bot API rate limits.
+- Completed messages and final error notices wait for Telegram's retry delay and retry publication up to three times within 60 seconds. Partially delivered responses reuse confirmed message IDs; a deferred preview is never treated as confirmed final delivery.
 - `telegram.primary_forum_chat_id` is used by `/topic` to create topics in one dedicated forum.
 - `telegram.auto_create_topics = false` keeps environment import manual; set it to `true` to auto-create missing forum topics from history.
 - `telegram.forum_sync_topics_per_poll` throttles topic sync work.

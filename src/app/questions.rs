@@ -165,11 +165,14 @@ async fn answer(
         return Ok(());
     }
     if let Ok(update_id) = HUMAN_UPDATE_ID.try_with(|id| *id) {
-        shared.store.begin_question_answer(
+        if let Err(error) = shared.store.begin_question_answer(
             update_id,
             pending.local_turn_id,
             &pending.request_id,
-        )?;
+        ) {
+            shared.pending_questions.lock().await.insert(token, pending);
+            return Err(error);
+        }
     }
     pending.answers.answers.insert(
         pending.request.questions[pending.index].id.clone(),
@@ -185,10 +188,11 @@ async fn answer(
             .responder
             .send(UserInputDecision::Answers(pending.answers));
     } else {
-        show_question(&shared, &token, &mut pending).await?;
+        let result = show_question(&shared, &token, &mut pending).await;
         if !pending.closed.is_cancelled() && !pending.responder.is_closed() {
             shared.pending_questions.lock().await.insert(token, pending);
         }
+        result?;
     }
     Ok(())
 }
@@ -219,7 +223,7 @@ pub(super) async fn handle_callback(
         } else {
             let mut pending = guard.remove(token).expect("checked pending question");
             drop(guard);
-            show_question(&shared, token, &mut pending).await?;
+            let result = show_question(&shared, token, &mut pending).await;
             if !pending.closed.is_cancelled() && !pending.responder.is_closed() {
                 shared
                     .pending_questions
@@ -227,6 +231,7 @@ pub(super) async fn handle_callback(
                     .await
                     .insert(token.to_string(), pending);
             }
+            result?;
         }
         return Ok(true);
     }

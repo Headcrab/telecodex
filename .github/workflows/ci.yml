@@ -29,6 +29,8 @@ jobs:
       - run: cargo build --locked --release --no-default-features
       - run: python3 -B tests/ingress_io.py target/release/telecodex
       - run: python3 -B tests/questions_io.py target/release/telecodex
+      - run: python3 -B tests/icons_io.py target/release/telecodex
+      - run: python3 -B -m unittest discover -s tests -p test_icons_io.py -v
   audio:
     runs-on: ubuntu-latest
     timeout-minutes: 20

@@ -721,13 +721,32 @@ impl LiveTurnSink {
     }
 
     async fn flush(&mut self, force: bool) -> Result<()> {
+        if !force {
+            return self.flush_once(false).await.map(|_| ());
+        }
+        tokio::time::timeout(Duration::from_secs(60), async {
+            for _ in 0..3 {
+                if let Some(until) = self.edit_backoff_until {
+                    tokio::time::sleep_until(until.into()).await;
+                }
+                if self.flush_once(true).await? {
+                    return Ok(());
+                }
+            }
+            bail!("Telegram final delivery remained rate-limited after three attempts")
+        })
+        .await
+        .context("Telegram final delivery timed out after 60 seconds")?
+    }
+
+    async fn flush_once(&mut self, force: bool) -> Result<bool> {
         if (!force && !self.shared.config.telegram.show_unfinished_messages)
             || (force && self.pending_text.trim().is_empty())
         {
-            return Ok(());
+            return Ok(true);
         }
         if self.message_committed {
-            return Ok(());
+            return Ok(true);
         }
         if self
             .edit_backoff_until
@@ -739,7 +758,7 @@ impl LiveTurnSink {
             .edit_backoff_until
             .is_some_and(|until| until > Instant::now())
         {
-            return Ok(());
+            return Ok(false);
         }
         let visible_text = self.visible_text(force);
         let min_flush_interval = self.min_flush_interval();
@@ -747,14 +766,14 @@ impl LiveTurnSink {
             && self.last_flushed_text == visible_text
             && self.last_flush_at.elapsed() < min_flush_interval
         {
-            return Ok(());
+            return Ok(true);
         }
         if !force && self.last_flush_at.elapsed() < min_flush_interval {
-            return Ok(());
+            return Ok(true);
         }
 
         if self.draft_id.is_some() && !force {
-            return self.flush_draft(&visible_text).await;
+            return self.flush_draft(&visible_text).await.map(|_| true);
         }
 
         let chunks = if force {
@@ -767,13 +786,10 @@ impl LiveTurnSink {
         };
         for (idx, chunk) in chunks.iter().enumerate() {
             let html = render_markdown_to_html(chunk);
-            if let Some(existing) = self
-                .messages
-                .get(idx)
-                .cloned()
-                .filter(|_| self.draft_id.is_none())
-            {
-                self.edit_message(existing, chunk, &html).await?;
+            if let Some(existing) = self.messages.get(idx).cloned() {
+                if !self.edit_message(existing, chunk, &html).await? {
+                    return Ok(false);
+                }
             } else {
                 let result = self
                     .shared
@@ -787,7 +803,7 @@ impl LiveTurnSink {
                 let message = match result {
                     Ok(message) => message,
                     Err(error) if self.defer_after_retry_after(&error, "telegram send chunk") => {
-                        return Ok(());
+                        return Ok(false);
                     }
                     Err(error) => return Err(error),
                 };
@@ -801,7 +817,7 @@ impl LiveTurnSink {
 
         self.last_flushed_text = visible_text;
         self.last_flush_at = Instant::now();
-        Ok(())
+        Ok(true)
     }
 
     fn min_flush_interval(&self) -> Duration {
@@ -859,7 +875,7 @@ impl LiveTurnSink {
         reference: TelegramMessageRef,
         raw_text: &str,
         html: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let result = self
             .shared
             .telegram
@@ -870,13 +886,13 @@ impl LiveTurnSink {
             ))
             .await;
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             Err(error) => {
                 if is_message_not_modified(&error) {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if self.defer_after_retry_after(&error, "telegram edit") {
-                    return Ok(());
+                    return Ok(false);
                 }
                 let fallback = html_escape::encode_safe(raw_text).to_string();
                 let fallback_result = self
@@ -889,13 +905,13 @@ impl LiveTurnSink {
                     ))
                     .await;
                 match fallback_result {
-                    Ok(_) => Ok(()),
-                    Err(fallback_error) if is_message_not_modified(&fallback_error) => Ok(()),
+                    Ok(_) => Ok(true),
+                    Err(fallback_error) if is_message_not_modified(&fallback_error) => Ok(true),
                     Err(fallback_error)
                         if self
                             .defer_after_retry_after(&fallback_error, "telegram edit fallback") =>
                     {
-                        Ok(())
+                        Ok(false)
                     }
                     Err(fallback_error) => Err(fallback_error)
                         .with_context(|| format!("telegram edit fallback failed after: {error:#}")),
@@ -908,7 +924,9 @@ impl LiveTurnSink {
         let Some(retry_after) = telegram_retry_after(error) else {
             return false;
         };
-        let until = Instant::now() + Duration::from_secs(retry_after.saturating_add(1));
+        // Longer server backoffs exceed final delivery's deadline. Bounding the
+        // instant also prevents a malformed retry_after from overflowing it.
+        let until = Instant::now() + Duration::from_secs(retry_after.saturating_add(1).min(61));
         self.edit_backoff_until = Some(until);
         tracing::warn!("{label} hit Telegram rate limit, backing off for {retry_after}s");
         true
@@ -1524,6 +1542,179 @@ fn mime_type_for_path(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::SearchMode;
+
+    fn delivered(id: i64) -> (u16, serde_json::Value) {
+        (
+            200,
+            serde_json::json!({"ok":true,"result": {
+                "message_id":id,"chat":{"id":1,"type":"private"},
+                "message_thread_id":2,"text":"receipt"
+            }}),
+        )
+    }
+
+    fn limited(seconds: u64) -> (u16, serde_json::Value) {
+        (
+            429,
+            serde_json::json!({"ok":false,"description":"rate limited",
+            "parameters":{"retry_after":seconds}}),
+        )
+    }
+
+    async fn delivery_sink(
+        mut replies: Vec<(u16, serde_json::Value)>,
+        draft: bool,
+        placeholder: bool,
+        chunk_size: usize,
+    ) -> (
+        LiveTurnSink,
+        tempfile::TempDir,
+        std::thread::JoinHandle<Vec<(String, serde_json::Value)>>,
+    ) {
+        replies.insert(
+            0,
+            (
+                200,
+                serde_json::json!({"ok":true,"result": {
+                    "id":123,"is_bot":true,"first_name":"Fixture"
+                }}),
+            ),
+        );
+        let (api, server) = crate::telegram::tests::serve_api(replies);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Config = toml::from_str(&format!(
+            "db_path='{}'\nstartup_admin_ids=[100]\nedit_debounce_ms=0\nmax_text_chunk={chunk_size}\n\
+             [telegram]\nbot_token='synthetic'\napi_base='{api}'\nshow_unfinished_messages=true\n\
+             [codex]\ndefault_cwd='{}'\n",
+            dir.path().join("state.sqlite").display(), dir.path().display()
+        )).unwrap();
+        config.telegram.use_message_drafts = draft;
+        let app = App::bootstrap(config).await.unwrap();
+        let session = session_with_service_tier(None);
+        let sink = if draft {
+            LiveTurnSink::new_draft(app.shared, &session, None, 1)
+        } else {
+            LiveTurnSink::new_preview(
+                app.shared,
+                &session,
+                None,
+                placeholder.then_some(TelegramMessageRef {
+                    chat_id: 1,
+                    message_id: 500,
+                }),
+            )
+        };
+        (sink, dir, server)
+    }
+
+    #[tokio::test]
+    async fn final_delivery_retries_actual_send_and_edit_rate_limits() {
+        for placeholder in [false, true] {
+            let (mut sink, _dir, server) =
+                delivery_sink(vec![limited(0), delivered(501)], false, placeholder, 4000).await;
+            sink.pending_text = "final answer".to_string();
+            sink.finish(None).await.unwrap();
+            assert!(sink.message_committed);
+            assert_eq!(sink.last_flushed_text, "final answer");
+            let requests = server.join().unwrap();
+            let method = if placeholder {
+                "/editMessageText"
+            } else {
+                "/sendMessage"
+            };
+            assert_eq!(requests.len(), 3);
+            assert!(requests[1].0.contains(method));
+            assert!(requests[2].0.contains(method));
+            assert_eq!(requests[1].1["text"], requests[2].1["text"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn final_delivery_waits_for_preview_and_draft_backoff() {
+        for draft in [false, true] {
+            let (mut sink, _dir, server) =
+                delivery_sink(vec![limited(0), delivered(501)], draft, !draft, 4000).await;
+            sink.pending_text = "preview answer".to_string();
+            sink.flush(false).await.unwrap();
+            assert!(
+                sink.last_flushed_text.is_empty(),
+                "a deferred edit was not delivered"
+            );
+            assert!(sink.edit_backoff_until.is_some());
+            sink.pending_text = "final answer".to_string();
+            sink.finish(None).await.unwrap();
+            assert!(sink.message_committed);
+            let requests = server.join().unwrap();
+            assert!(requests[1].0.contains(if draft {
+                "/sendMessageDraft"
+            } else {
+                "/editMessageText"
+            }));
+            assert!(requests[2].0.contains(if draft {
+                "/sendMessage"
+            } else {
+                "/editMessageText"
+            }));
+            assert_eq!(requests[2].1["text"], "final answer");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_draft_final_retry_reuses_delivered_chunks() {
+        let (mut sink, _dir, server) = delivery_sink(
+            vec![delivered(501), limited(0), delivered(501), delivered(502)],
+            true,
+            false,
+            5,
+        )
+        .await;
+        sink.pending_text = "abcdefghij".to_string();
+        sink.finish(None).await.unwrap();
+        assert!(sink.message_committed);
+        assert_eq!(sink.messages.len(), 2);
+        let requests = server.join().unwrap();
+        let sends = requests
+            .iter()
+            .filter(|(method, _)| method.contains("/sendMessage "))
+            .collect::<Vec<_>>();
+        assert_eq!(sends.len(), 3, "first chunk must not be sent twice");
+        assert_eq!(
+            sends
+                .iter()
+                .filter(|(_, body)| body["text"] == "abcde")
+                .count(),
+            1
+        );
+        assert!(requests[3].0.contains("/editMessageText"));
+        assert_eq!(requests[3].1["message_id"], 501);
+    }
+
+    #[tokio::test]
+    async fn persistent_final_rate_limit_fails_after_three_actual_attempts() {
+        let (mut sink, _dir, server) =
+            delivery_sink(vec![limited(0), limited(0), limited(0)], false, false, 4000).await;
+        sink.pending_text = "final answer".to_string();
+        let error = sink.finish(None).await.unwrap_err();
+        assert!(error.to_string().contains("three attempts"));
+        assert!(!sink.message_committed);
+        assert!(sink.last_flushed_text.is_empty());
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn final_delivery_deadline_bounds_existing_long_backoff() {
+        let (mut sink, _dir, server) = delivery_sink(vec![], false, false, 4000).await;
+        server.join().unwrap();
+        tokio::time::pause();
+        sink.pending_text = "final answer".to_string();
+        sink.edit_backoff_until = Some(Instant::now() + Duration::from_secs(120));
+        let started = tokio::time::Instant::now();
+        let error = sink.finish(None).await.unwrap_err();
+        assert!(error.to_string().contains("60 seconds"));
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(61));
+        assert!(!sink.message_committed);
+    }
 
     fn session_with_service_tier(service_tier: Option<&str>) -> crate::models::SessionRecord {
         crate::models::SessionRecord {

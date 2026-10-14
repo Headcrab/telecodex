@@ -46,6 +46,10 @@ contain up to three questions; choices and text are assembled into one native
 response keyed by the original question IDs. Long questions are split without
 dropping content; reply to a current part or use the last part's buttons.
 
+Temporary display or SQLite write failures while answering or reopening preserve
+the pending dialogue. Use `/questions` to display its current step again; answers
+already admitted in that dialogue remain intact. This does not start a new turn.
+
 The RPC receiver keeps reading while a human considers a question. Nonblocking
 native requests can coexist with continuing commentary and work. Responses are
 sent to the original JSON-RPC request, never as new prompts or model turns.
@@ -78,7 +82,8 @@ are tracked separately in [#18](https://github.com/AlterMundi/telecodex/issues/1
 loopback HTTP, WebSocket framing and SQLite: multistep answers, reopening,
 steering, asynchronous continuation, integer/string IDs, long Unicode text,
 two simultaneous topics, mode transitions, stop/cancel, restart, lost receipt,
-disconnect, unavailable modes and mismatched Telegram delivery receipts.
+disconnect, unavailable modes, mismatched Telegram delivery receipts and temporary
+send/answer-journal/question-receipt failures.
 Synthetic qualification does not establish human Telegram acceptance.
 
 Polling admits updates durably without waiting for a topic's native steering or

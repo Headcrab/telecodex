@@ -54,7 +54,7 @@ startup_admin_ids=[100]
 bot_token_file="{tokenfile}"
 api_base="http://127.0.0.1:{server.server_port}"
 [codex]
-binary="/bin/true"
+binary="{sys.executable}"
 default_cwd="{root}"
 import_cli_history=false
 import_desktop_history=false
@@ -65,6 +65,7 @@ import_desktop_history=false
             result = subprocess.run([BINARY, str(cfg)], cwd=root, env=env,
                                     capture_output=True, text=True, timeout=5)
             assert result.returncode != 0
+            assert 'getMe JSON decode failed' in result.stderr, 'probe did not reach Telegram response decoding'
             assert token not in result.stderr, 'malformed success leaked the bot token'
             print(json.dumps({'scenario': 'malformed_success_token',
                               'exit': result.returncode,

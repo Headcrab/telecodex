@@ -34,6 +34,8 @@ class Journey:
         self.finished = threading.Event()
         self.question = threading.Event()
         self.delivery_reply = threading.Event()
+        self.fail_question_prefix = None
+        self.failed_deliveries = 0
         owner = self
 
         class Native(socketserver.BaseRequestHandler):
@@ -56,6 +58,18 @@ class Journey:
             def do_POST(self):
                 payload = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))) or b'{}')
                 method = self.path.rsplit('/', 1)[-1]
+                with owner.lock:
+                    fail_delivery = method == 'sendMessage' and owner.fail_question_prefix is not None and html.unescape(payload['text']).startswith(owner.fail_question_prefix)
+                    if fail_delivery:
+                        owner.fail_question_prefix = None
+                        owner.failed_deliveries += 1
+                if fail_delivery:
+                    body = json.dumps({'ok': False, 'description': 'synthetic temporary delivery failure'}).encode()
+                    self.send_response(500)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if method == 'getMe':
                     result = {'id': 123, 'is_bot': True, 'first_name': 'Fixture',
                               'username': 'FixtureBot', 'has_topics_enabled': True}
@@ -346,6 +360,44 @@ def scenario(binary, mode):
         if mode == 'async':
             j.wait(lambda: any('Native work continued' in m[1]['text'] for m in j.messages))
             assert j.row('SELECT status FROM turns') == [('running',)]
+        option_id = None
+        if mode in ('reopen_failure', 'question_send_failure', 'answer_store_failure', 'receipt_store_failure'):
+            if mode == 'reopen_failure':
+                j.admit('/questions')
+                j.wait(lambda: any('Pending Codex questions.' in m[1]['text'] for m in j.messages))
+                picker = next(m for m in reversed(j.messages) if 'Pending Codex questions.' in m[1]['text'])
+                j.fail_question_prefix = 'Codex question 1/'
+                failed_id = j.admit(callback=(picker[0], picker[1]['reply_markup']['inline_keyboard'][0][0]['callback_data']))
+                j.wait(lambda: j.row('SELECT status FROM incoming_updates WHERE update_id=?', (failed_id,)) == [('undetermined',)])
+            else:
+                if mode == 'question_send_failure':
+                    j.fail_question_prefix = 'Codex question 2/'
+                else:
+                    table = 'question_answers' if mode == 'answer_store_failure' else 'question_messages'
+                    with sqlite3.connect(j.root / 'state.sqlite') as db:
+                        db.execute(f"CREATE TRIGGER fail_question_write BEFORE INSERT ON {table} BEGIN SELECT RAISE(FAIL, 'synthetic store failure'); END")
+                option_id = j.admit(callback=j.button(first, ':0'))
+                expected_status = 'undetermined' if mode == 'answer_store_failure' else 'answering'
+                j.wait(lambda: j.row('SELECT status FROM incoming_updates WHERE update_id=?', (option_id,)) == [(expected_status,)])
+            after = len(j.messages)
+            j.admit('/questions')
+            j.wait(lambda: any('questions' in m[1]['text'].lower() for m in j.messages[after:]))
+            picker = next(m for m in reversed(j.messages[after:]) if 'questions' in m[1]['text'].lower())
+            assert 'Pending Codex questions.' in picker[1]['text'], 'temporary failure discarded the native dialogue'
+            assert j.row('SELECT status FROM turns') == [('running',)]
+            assert not j.answers and not any(m.get('method') == 'turn/interrupt' for m in j.rpc)
+            if mode in ('reopen_failure', 'question_send_failure'):
+                assert j.failed_deliveries == 1
+            if mode in ('answer_store_failure', 'receipt_store_failure'):
+                with sqlite3.connect(j.root / 'state.sqlite') as db:
+                    db.execute('DROP TRIGGER fail_question_write')
+            reopened_id = j.admit(callback=(picker[0], picker[1]['reply_markup']['inline_keyboard'][0][0]['callback_data']))
+            j.wait(lambda: j.row('SELECT status FROM incoming_updates WHERE update_id=?', (reopened_id,)) == [('handled',)])
+            index = 1 if mode in ('reopen_failure', 'answer_store_failure') else 2
+            j.wait(lambda: j.controls(index) and j.controls(index)[0]['message_id'] != first[0]['message_id'])
+            if index == 1:
+                first = j.controls(1)
+                option_id = None
         if mode == 'roundtrip':
             j.admit(callback=j.button(first, ':0'),user=101)
             j.admit(callback=j.button(first, ':0'),topic=8)
@@ -372,7 +424,8 @@ def scenario(binary, mode):
             assert j.answers[0] == {'id':'question-native-topic-8','result':{'answers':{
                 'scope':{'answers':['Other scope']},'notes':{'answers':['Other notes']}}}}
             j.wait(lambda: j.row('SELECT status FROM turns ORDER BY id') == [('running',),('completed',)])
-        option_id = j.admit(callback=j.button(first, ':0'))
+        if option_id is None:
+            option_id = j.admit(callback=j.button(first, ':0'))
         j.wait(lambda: j.controls(2))
         second = j.controls(2)
         j.admit(callback=j.button(first, ':0'))  # Duplicate old control must not answer question two.
@@ -433,5 +486,5 @@ def scenario(binary, mode):
 
 if __name__ == '__main__':
     binary = str(pathlib.Path(sys.argv[1]).resolve())
-    for mode in sys.argv[2:] or ['implicit_reply','force_reply','roundtrip','async','numeric','long','two_topics','default','cancel','stop','secret','restart','restart_gap','disconnect','unsupported','wrong_receipt']:
+    for mode in sys.argv[2:] or ['implicit_reply','force_reply','roundtrip','async','numeric','long','two_topics','default','cancel','stop','secret','restart','restart_gap','disconnect','unsupported','wrong_receipt','reopen_failure','question_send_failure','answer_store_failure','receipt_store_failure']:
         scenario(binary, mode)
